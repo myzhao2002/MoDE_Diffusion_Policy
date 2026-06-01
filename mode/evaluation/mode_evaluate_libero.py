@@ -250,7 +250,34 @@ class EvaluateLibero:
         demo_name = os.path.splitext(
             os.path.basename(self.benchmark_instance.get_task_demonstration(idx))
         )[0]
+        matched = demo_name in self.plan_by_task
         plan_text = self.plan_by_task.get(demo_name, task_i.language)
+
+        # ---- one-shot diagnostics to verify train/eval consistency ----
+        log_print(f"[PLAN-DBG] task={task_str} demo_name={demo_name} plan_matched={matched}")
+        log_print(f"[PLAN-DBG]   lang_text='{task_i.language}'")
+        log_print(f"[PLAN-DBG]   plan_text='{str(plan_text)[:160]}'")
+        if not getattr(self, "_dbg_model_flags_printed", False):
+            self._dbg_model_flags_printed = True
+            log_print(
+                "[MODEL-DBG] use_plan_fusion=%s use_text_not_embedding=%s multistep=%s "
+                "num_sampling_steps=%s sampler_type=%s dtype=%s"
+                % (
+                    getattr(model, "use_plan_fusion", None),
+                    getattr(model, "use_text_not_embedding", None),
+                    getattr(model, "multistep", None),
+                    getattr(model, "num_sampling_steps", None),
+                    getattr(model, "sampler_type", None),
+                    getattr(model, "dtype", None),
+                )
+            )
+            fuser = getattr(model, "task_plan_fuser", None)
+            if fuser is not None:
+                w = fuser.net[0].weight
+                log_print(
+                    "[MODEL-DBG] task_plan_fuser net[0].weight dtype=%s mean=%.5f std=%.5f"
+                    % (w.dtype, w.float().mean().item(), w.float().std().item())
+                )
 
         num_success = 0
         for i in tqdm(range(self.n_eval), desc="Evaluating"):
@@ -295,6 +322,12 @@ class EvaluateLibero:
                 # data = raw_obs_to_tensor_obs(obs, task_emb, cfg)
                 actions = model.step(data, goal)
                 actions = actions.cpu().numpy()
+                if i == 0 and steps <= 3:
+                    flat = np.asarray(actions).reshape(-1)
+                    log_print(
+                        "[ACT-DBG] rollout=1 step=%d action=%s |a|_mean=%.4f"
+                        % (steps, np.array2string(flat, precision=3, suppress_small=True), np.abs(flat).mean())
+                    )
                 obs, reward, done, info = env.step(actions)
 
                 if store_video_this_rollout:
