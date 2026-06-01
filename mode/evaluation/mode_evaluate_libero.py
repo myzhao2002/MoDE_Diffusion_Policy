@@ -341,6 +341,10 @@ class EvaluateLibero:
 
     def apply_transforms(self, data, train=False):
         # Assuming data contains images in 'rgb_static' and 'rgb_gripper'
+        # The transforms config is split into 'train'/'val'; evaluation uses 'val'
+        # (no random augmentation). Fall back to a flat layout if not split.
+        split = 'train' if train else 'val'
+        transforms = self.transforms[split] if split in self.transforms else self.transforms
         for key in data['rgb_obs']:
             # print(key)
             x = data['rgb_obs'][key]
@@ -348,7 +352,7 @@ class EvaluateLibero:
                 x = np.expand_dims(x, axis=0)
                 # print(x.shape)
             x = torch.from_numpy(x).byte().permute(0, 3, 1, 2)
-            for transform in self.transforms[key]:
+            for transform in transforms[key]:
                 x = transform(x)
             data['rgb_obs'][key] = x.unsqueeze(0).to(self.device)
             # data['rgb_obs'][key] = transforms[key](data['rgb_obs'][key])
