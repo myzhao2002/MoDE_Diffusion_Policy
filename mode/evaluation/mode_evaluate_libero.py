@@ -63,7 +63,13 @@ from mode.rollout.rollout_video import RolloutVideo
 from typing import Any, Dict, Tuple, Union
 
 
-log_print = logging.getLogger(__name__)
+_log_print_logger = logging.getLogger(__name__)
+def log_print(*args, **kwargs):
+    # Called throughout this module as a function (log_print("...")); keep it
+    # callable and also forward to the logger.
+    msg = " ".join(str(a) for a in args)
+    print(msg, flush=True)
+    _log_print_logger.info(msg)
 def dbg(msg):
     print(f"[EVAL-DBG {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 def get_log_dir(log_dir):
