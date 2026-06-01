@@ -32,7 +32,9 @@ PRETRAINED="${PRETRAINED:-/root/autodl-tmp/MoDE_Pretrained}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 DEVICES="${DEVICES:-1}"
 # SHUTDOWN_MODE: always | on-success | never
-SHUTDOWN_MODE="${SHUTDOWN_MODE:-always}"
+# Default on-success: shut down after a SUCCESSFUL run, but keep the instance
+# alive if training crashes so you can debug (and don't waste a shutdown cycle).
+SHUTDOWN_MODE="${SHUTDOWN_MODE:-on-success}"
 LOG_DIR="${LOG_DIR:-/root/autodl-tmp}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/train_$(date +%Y%m%d_%H%M%S).log}"
 
@@ -69,6 +71,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # WANDB_MODE: online (default, real-time upload) | offline | disabled.
 # Requires a logged-in account: `wandb login` once, or export WANDB_API_KEY.
 export WANDB_MODE="${WANDB_MODE:-online}"
+# Force HuggingFace / transformers to read CLIP weights from the LOCAL cache
+# instead of doing online metadata checks against hf-mirror every time a model
+# is instantiated. Without this (especially with academic acceleration ON, so
+# the mirror is reachable) startup hangs on hundreds of HEAD requests even
+# though the weights are already cached. Override with =0 to allow downloads.
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export PYTHONPATH="${PYTHONPATH:-}:$PROJECT_DIR/LIBERO:$PROJECT_DIR"
 
 cd "$PROJECT_DIR" || { echo "FATAL: cannot cd to $PROJECT_DIR"; exit 1; }
