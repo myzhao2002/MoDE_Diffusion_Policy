@@ -4,11 +4,24 @@ trained, and is it being restored at eval time?
 
 Run on autodl:
     conda activate lerobot
-    python inspect_fuser.py
+    python inspect_fuser.py --ckpt /path/to/best-epoch=19-....ckpt
+
+If --ckpt is omitted it falls back to DEFAULT_CKPT below.
 """
+import argparse
 import torch
 
-CKPT = "/root/autodl-tmp/MoDE_ckpts/best-epoch=18-val_act/lang_act_loss_pp=0.0207.ckpt"
+# NOTE: the ModelCheckpoint filename embeds the monitored metric name
+# "val_act/lang_act_loss_pp", and the "/" in it makes Lightning create a
+# SUBDIRECTORY. So a "best-epoch=19-..." checkpoint actually lives at
+#   .../MoDE_ckpts/best-epoch=19-val_act/lang_act_loss_pp=0.0463.ckpt
+# (the "best-epoch=19-val_act" part is a directory). Quote the path on the CLI.
+DEFAULT_CKPT = "/root/autodl-tmp/MoDE_ckpts/best-epoch=19-val_act/lang_act_loss_pp=0.0463.ckpt"
+
+parser = argparse.ArgumentParser(description="Inspect task_plan_fuser weights in a checkpoint.")
+parser.add_argument("--ckpt", default=DEFAULT_CKPT, help="path to the .ckpt to inspect")
+args = parser.parse_args()
+CKPT = args.ckpt
 
 print(f"Loading checkpoint: {CKPT}")
 ck = torch.load(CKPT, map_location="cpu", weights_only=False)
