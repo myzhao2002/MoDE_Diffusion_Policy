@@ -7,6 +7,7 @@ import wandb
 import hydra
 from omegaconf import DictConfig
 import torch
+torch.set_float32_matmul_precision('high')  # 显式使用新版 API 设置矩阵乘法精度
 from pytorch_lightning import Callback, LightningModule, seed_everything, Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.utilities import rank_zero_only
@@ -89,18 +90,33 @@ def train(cfg: DictConfig) -> None:
         work_dir.mkdir(exist_ok=True)
         os.chdir(work_dir)
         
+        # trainer_args = {
+        #     **cfg.trainer,
+        #     "logger": train_logger,
+        #     "callbacks": callbacks,
+        #     "benchmark": False,
+        #     "strategy": "ddp_find_unused_parameters_true",
+        #     "accelerator": "gpu",
+        #     "devices": cfg.trainer.devices,
+        #     "use_distributed_sampler": True,
+        #     "default_root_dir": work_dir,
+        #     "sync_batchnorm": True,
+        # }
+        num_devices = cfg.trainer.devices if isinstance(cfg.trainer.devices, int) else len(cfg.trainer.devices)
+        strategy = "ddp_find_unused_parameters_true" if num_devices > 1 else "auto"
+
         trainer_args = {
-            **cfg.trainer,
-            "logger": train_logger,
-            "callbacks": callbacks,
-            "benchmark": False,
-            "strategy": "ddp_find_unused_parameters_true",
-            "accelerator": "gpu",
-            "devices": cfg.trainer.devices,
-            "use_distributed_sampler": True,
-            "default_root_dir": work_dir,
-            "sync_batchnorm": True,
-        }
+    **cfg.trainer,
+    "logger": train_logger,
+    "callbacks": callbacks,
+    "benchmark": False,
+    "strategy": strategy,
+    "accelerator": "gpu",
+    "devices": cfg.trainer.devices,
+    "use_distributed_sampler": num_devices > 1,
+    "default_root_dir": work_dir,
+    "sync_batchnorm": num_devices > 1,
+}
         
         # Log configuration
         log_rank_0(f"Training config for seed {cfg.seed}:\n{cfg}")

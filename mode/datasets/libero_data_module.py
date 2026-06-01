@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 from torch.utils.data import DataLoader, ConcatDataset, RandomSampler, random_split, Dataset
 import pytorch_lightning as pl
@@ -20,6 +21,7 @@ class TranslatedSequenceVLDataset(Dataset):
         sequence_dataset,
         task_emb,
         task_description,
+        plan_text=None,
         obs_seq_len: int =1,
         act_seq_len: int =1,
         transforms=None
@@ -32,6 +34,7 @@ class TranslatedSequenceVLDataset(Dataset):
         self.sequence_dataset.goal_mode = "last"
         self.task_emb = task_emb
         self.task_description = task_description
+        self.plan_text = plan_text if plan_text is not None else task_description
         self.n_demos = self.sequence_dataset.n_demos
         self.total_num_sequences = self.sequence_dataset.total_num_sequences
 
@@ -43,6 +46,7 @@ class TranslatedSequenceVLDataset(Dataset):
         return_dict = self.sequence_dataset.__getitem__(idx)
         return_dict["task_emb"] = self.task_emb
         return_dict["lang_text"] = self.task_description
+        return_dict["plan_text"] = self.plan_text
         return_dict = self.get_des_act_obs_sequence(return_dict)
         main_dict["lang"] = self.translation_dict(return_dict)
         # main_dict['modality'] = 'lang'
@@ -89,6 +93,7 @@ class TranslatedSequenceVLDataset(Dataset):
             # translated_dict['gripper_states'] = dict['obs']['gripper_states']
 
         translated_dict['lang_text'] = dict['lang_text']
+        translated_dict['plan_text'] = dict['plan_text']
         translated_dict['depth_obs'] = {}
         translated_dict['actions'] = dict['actions']
         # translated_dict['robot_obs'] = dict['robot_obs']
@@ -117,6 +122,7 @@ class LiberoDataModule(pl.LightningDataModule):
         benchmark_name: str = 'libero_goal',
         task_embedding_format: str = 'clip',
         split_ratio: float = 0.0,
+        plan_file: str = "",
         **kwargs,
     ):
         super().__init__()
@@ -132,6 +138,31 @@ class LiberoDataModule(pl.LightningDataModule):
         self.benchmark_name = benchmark_name
         self.task_embedding_format = task_embedding_format
         self.split_ratio = split_ratio
+        self.plan_file = plan_file
+        self.plan_by_task = {}
+        self._load_plan_mapping()
+
+    def _load_plan_mapping(self):
+        if not self.plan_file:
+            return
+        if not os.path.exists(self.plan_file):
+            print(f"[LiberoDataModule] plan_file not found: {self.plan_file}")
+            return
+
+        with open(self.plan_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                task = obj.get("task", "")
+                plan_text = obj.get("plan_text", "")
+                if task and plan_text:
+                    self.plan_by_task[task] = plan_text
+        print(f"[LiberoDataModule] loaded plan_text for {len(self.plan_by_task)} tasks")
 
     def create_cfg_for_libero(self, task_embedding_format):
         self.cfg = DictConfig({'task_embedding_format': task_embedding_format,
@@ -162,6 +193,7 @@ class LiberoDataModule(pl.LightningDataModule):
 
         for i in range(num_tasks):
             dataset_path = os.path.join(datasets_default_path, benchmark_instance.get_task_demonstration(i))
+            task_name = os.path.splitext(os.path.basename(dataset_path))[0]
 
             # for image and language goals, for now lets just use language since mode doesn't deal with image yet?
             # task_i_dataset, shape_meta = get_split_dataset(
@@ -193,6 +225,7 @@ class LiberoDataModule(pl.LightningDataModule):
                 task_i_dataset,
                 task_embs[i],
                 descriptions[i],
+                plan_text=self.plan_by_task.get(task_name, descriptions[i]),
                 act_seq_len=datasets_cfg.lang_dataset.action_seq_len,
                 obs_seq_len=datasets_cfg.lang_dataset.obs_seq_len,
                 transforms=self.transforms

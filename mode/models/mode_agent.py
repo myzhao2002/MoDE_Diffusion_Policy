@@ -21,6 +21,7 @@ from mode.models.perceptual_encoders.resnets import ResNetEncoderWithFiLM
 from mode.models.perceptual_encoders.pretrained_resnets import FiLMResNet34Policy, FiLMResNet50Policy
 from mode.models.networks.modedit import NoiseBlockMoE 
 from mode.utils.lang_buffer import AdvancedLangEmbeddingBuffer
+from mode.models.networks.task_plan_fuser import TaskPlanFuser
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,9 @@ class MoDEAgent(pl.LightningModule):
         use_proprio: bool = False,
         act_window_size: int = 10,
         resnet_type: str = '18', 
+        use_plan_fusion: bool = True,
+        plan_fuser_hidden_dim: int = 512,
+        plan_fuser_dropout: float = 0.1,
     ):
         super(MoDEAgent, self).__init__()
         # Set obs_dim based on resnet_type
@@ -96,8 +100,15 @@ class MoDEAgent(pl.LightningModule):
         self.seed = seed
         self.use_lr_scheduler = use_lr_scheduler
         self.use_proprio = use_proprio
+        self.use_plan_fusion = use_plan_fusion
         # goal encoders
         self.language_goal = hydra.utils.instantiate(language_goal) if language_goal else None
+        self.task_plan_fuser = TaskPlanFuser(
+            in_dim=cond_dim,
+            hidden_dim=plan_fuser_hidden_dim,
+            out_dim=cond_dim,
+            dropout=plan_fuser_dropout,
+        )
         self.modality_scope = "lang"
         self.optimizer_config = optimizer
         self.lr_scheduler = lr_scheduler
@@ -130,6 +141,13 @@ class MoDEAgent(pl.LightningModule):
         self.need_precompute_experts_for_inference = False
 
         self.lang_buffer = AdvancedLangEmbeddingBuffer(self.language_goal, 10000)
+
+    def _compute_fused_goal_embedding(self, task_text, plan_text=None):
+        task_emb = self.lang_buffer.get_goal_instruction_embeddings(task_text)
+        if plan_text is None:
+            return task_emb
+        plan_emb = self.lang_buffer.get_goal_instruction_embeddings(plan_text)
+        return self.task_plan_fuser(task_emb, plan_emb)
 
     def load_pretrained_parameters(self, ckpt_path, strict: bool = False):
         """
@@ -533,8 +551,11 @@ class MoDEAgent(pl.LightningModule):
         rgb_gripper = dataset_batch["rgb_obs"]['rgb_gripper'] #[:, :-1]
 
         if self.use_text_not_embedding:
-            # latent_goal = self.language_goal(dataset_batch["lang_text"]).to(rgb_static.dtype)
-            latent_goal = self.lang_buffer.get_goal_instruction_embeddings(dataset_batch["lang_text"]).to(rgb_static.dtype)
+            plan_text = dataset_batch.get("plan_text", None)
+            if self.use_plan_fusion and plan_text is not None:
+                latent_goal = self._compute_fused_goal_embedding(dataset_batch["lang_text"], plan_text).to(rgb_static.dtype)
+            else:
+                latent_goal = self.lang_buffer.get_goal_instruction_embeddings(dataset_batch["lang_text"]).to(rgb_static.dtype)
         else:
             latent_goal = self.language_goal(dataset_batch["lang"]).to(rgb_static.dtype)
 
@@ -586,9 +607,10 @@ class MoDEAgent(pl.LightningModule):
         Method for doing inference with the model.
         """
         if self.use_text_not_embedding:
-            # latent_goal = self.language_goal(goal["lang_text"])
-            latent_goal = self.lang_buffer.get_goal_instruction_embeddings(goal["lang_text"])
-            latent_goal = latent_goal.to(torch.float32)
+            if self.use_plan_fusion and "plan_text" in goal:
+                latent_goal = self._compute_fused_goal_embedding(goal["lang_text"], goal["plan_text"]).to(torch.float32)
+            else:
+                latent_goal = self.lang_buffer.get_goal_instruction_embeddings(goal["lang_text"]).to(torch.float32)
         else:
             latent_goal = self.language_goal(goal["lang"]).unsqueeze(0).to(torch.float32).to(obs["rgb_obs"]['rgb_static'].device)
         if self.need_precompute_experts_for_inference:

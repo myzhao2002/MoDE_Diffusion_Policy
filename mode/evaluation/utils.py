@@ -65,7 +65,8 @@ def load_pl_module_from_checkpoint(
     filepath: Union[Path, str],
     epoch: int = 1,
     overwrite_cfg: dict = {},
-    use_ema_weights: bool = False
+    use_ema_weights: bool = False,
+    config_dir: Union[Path, str, None] = None,
 ):
     if isinstance(filepath, str):
         filepath = Path(filepath)
@@ -79,7 +80,9 @@ def load_pl_module_from_checkpoint(
         filedir = filepath.parents[0]
     else:
         raise ValueError(f"not valid file path: {str(filepath)}")
-    config = get_config_from_dir(filedir)
+    # config = get_config_from_dir(filedir)
+    cfg_src_dir = Path(config_dir) if config_dir is not None else filedir
+    config = get_config_from_dir(cfg_src_dir)
     class_name = config.model.pop("_target_")
     if "_recursive_" in config.model:
         del config.model["_recursive_"]
@@ -156,7 +159,8 @@ def get_default_model_and_env(train_folder, dataset_path, checkpoint, env=None, 
 
 
 def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, lang_embeddings=None, prep_dm_and_deps=True, device_id=0, eval_cfg_overwrite={}):
-    train_cfg_path = Path(train_folder) / checkpoint / ".hydra/config.yaml"
+    # train_cfg_path = Path(train_folder) / checkpoint / ".hydra/config.yaml"
+    train_cfg_path = Path(train_folder) / ".hydra" / "config.yaml"
     train_cfg_path = format_sftp_path(train_cfg_path)
     def_cfg = OmegaConf.load(train_cfg_path)
     eval_override_cfg = OmegaConf.create(eval_cfg_overwrite)
@@ -194,10 +198,18 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
     module_path = (Path(train_folder).expanduser())
 
     print(f"Loading model from {module_path / checkpoint}")
-    model = load_mode_from_safetensor(
-        module_path / checkpoint,
-        overwrite_cfg=eval_cfg_overwrite.model if "model" in eval_cfg_overwrite else {},
-    )
+    # model = load_mode_from_safetensor(
+    #     module_path / checkpoint,
+    #     overwrite_cfg=eval_cfg_overwrite.model if "model" in eval_cfg_overwrite else {},
+    # )
+    overwrite_cfg = eval_cfg_overwrite.model if "model" in eval_cfg_overwrite else {}
+    model = load_pl_module_from_checkpoint(
+    checkpoint,
+    epoch=-1,
+    overwrite_cfg=overwrite_cfg,
+    config_dir=train_folder,
+)
+    
     model.freeze()
     model = model.cuda(device)
     print("Successfully loaded model.")

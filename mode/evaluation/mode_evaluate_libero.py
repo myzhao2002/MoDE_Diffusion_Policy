@@ -64,7 +64,8 @@ from typing import Any, Dict, Tuple, Union
 
 
 log_print = logging.getLogger(__name__)
-
+def dbg(msg):
+    print(f"[EVAL-DBG {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 def get_log_dir(log_dir):
     if log_dir is not None:
         log_dir = Path(log_dir)
@@ -93,10 +94,14 @@ class EvaluateLibero:
         n_eval,
         task_embedding_format,
         device,
+        plan_file="",
     ):
         self.model = model
         self.transforms = transforms
         self.log_dir = log_dir
+        self.plan_file = plan_file
+        self.plan_by_task = {}
+        self._load_plan_mapping()
 
         self.device = device
         self.task_order = 0
@@ -118,7 +123,7 @@ class EvaluateLibero:
         self.num_sequences = num_sequences
         self.max_steps = max_steps
         # self.save_dir = save_dir
-        self.device = None
+        # self.device = None
         self.eval_sequences = None
         self.init_states_paths = []
         self.cfg = {}
@@ -137,13 +142,35 @@ class EvaluateLibero:
 
         self.all_tasks = list(range(self.benchmark_instance.n_tasks))
 
+    def _load_plan_mapping(self):
+        if not self.plan_file:
+            return
+        if not os.path.exists(self.plan_file):
+            print(f"[EvaluateLibero] plan_file not found: {self.plan_file}")
+            return
+
+        with open(self.plan_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                task = obj.get("task", "")
+                plan_text = obj.get("plan_text", "")
+                if task and plan_text:
+                    self.plan_by_task[task] = plan_text
+        print(f"[EvaluateLibero] loaded plan_text for {len(self.plan_by_task)} tasks")
+
     def setup(self) -> None:
         if self.benchmark is None:
             self.eval_sequences = get_sequences(self.num_sequences)
             self.benchmark = get_benchmark(self.benchmark_name)(self.eval_sequences)
 
     def start(self) -> None:
-
+        dbg("enter EvaluateLibero.start")
         successes = self.evaluate_policy(self.model, store_video=self.num_videos)
 
         result_array = sum(successes) / len(successes)
@@ -162,7 +189,9 @@ class EvaluateLibero:
         successes = []
 
         for idx in self.all_tasks:  # Distribute tasks across GPUs
+            
             task_name = self.task_names[idx]
+            dbg(f"start task idx={idx}, name={task_name}")
             task_i = self.benchmark_instance.get_task(idx)
             task_emb = self.benchmark_instance.task_embs[idx]
             task_str = f"k{self.all_tasks[-1]}_p{idx}"
@@ -186,7 +215,9 @@ class EvaluateLibero:
         count = 0
         while not env_creation and count < 5:
             try:
+                dbg(f"[{task_str}] before OffScreenRenderEnv")
                 env = OffScreenRenderEnv(**env_args)
+                dbg(f"[{task_str}] after OffScreenRenderEnv")
                 env_creation = True
             except:
                 time.sleep(5)
@@ -200,6 +231,15 @@ class EvaluateLibero:
             self.init_states_folder, task_i.problem_folder, task_i.init_states_file
         )
         init_states = torch.load(init_states_path)
+
+        # Resolve the atomic plan for this task using the same key as training
+        # (the demonstration file basename, e.g. "..._demo"). Fall back to the
+        # task instruction when no plan is available, matching the data module.
+        demo_name = os.path.splitext(
+            os.path.basename(self.benchmark_instance.get_task_demonstration(idx))
+        )[0]
+        plan_text = self.plan_by_task.get(demo_name, task_i.language)
+
         num_success = 0
         for i in tqdm(range(self.n_eval), desc="Evaluating"):
             store_video_this_rollout = i < store_video
@@ -209,14 +249,18 @@ class EvaluateLibero:
                 video_path = os.path.join(self.log_dir, video_filename)
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec for MP4
                 video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (self.img_w, self.img_h))
-
+            dbg(f"[{task_str}] before env.reset")
             env.reset()
-
+            dbg(f"[{task_str}] after env.reset")
             done = False
             steps = 0
             model.reset()
-            obs = env.set_init_state(init_states)
 
+            dbg(f"[{task_str}] before set_init_state")   
+            obs = env.set_init_state(init_states)
+            dbg(f"[{task_str}] after set_init_state")
+
+            
             # dummy actions [env_num, 7] all zeros for initial physics simulation
             dummy = np.zeros(7)
             for _ in range(5):
@@ -229,7 +273,9 @@ class EvaluateLibero:
 
             while steps < self.max_steps:
                 steps += 1
-                data, goal = self.process_env_obs(obs, task_emb, task_i.language)
+                if steps % 20 == 0:
+                    dbg(f"[{task_str}] rollout={i+1} step={steps} done={done}")
+                data, goal = self.process_env_obs(obs, task_emb, task_i.language, plan_text)
                 # data = raw_obs_to_tensor_obs(obs, task_emb, cfg)
                 actions = model.step(data, goal)
                 actions = actions.cpu().numpy()
@@ -293,35 +339,89 @@ class EvaluateLibero:
 
         return data
 
-    def process_env_obs(self, env_obs, lang_embed, lang_text=None):
+    def process_env_obs(self, env_obs, lang_embed, lang_text=None, plan_text=None):
         return_obs = self.translate_obs_space(env_obs)
         return_obs = self.apply_transforms(return_obs)
 
         goal = {}
         goal['lang_text'] = lang_text
         goal['lang'] = lang_embed
+        if plan_text is not None:
+            goal['plan_text'] = plan_text
 
         return return_obs, goal
 
+# @hydra.main(config_path="../../conf", config_name="mode_evaluate_libero")
+# def main(cfg):
+#     seed_everything(0, workers=True)
+
+    
+#     model, _, dm, _ = get_default_mode_and_env(
+#         cfg.train_folder,
+#         cfg.dataset_path,
+#         cfg.checkpoint,
+#         env=42,
+#         lang_embeddings=None,
+#         eval_cfg_overwrite=cfg.eval_cfg_overwrite,
+#         device_id=cfg.device,
+#         prep_dm_and_deps=False
+#     )
+
+#     model = model.to(cfg.device)
+#     model.eval()
+
+#     log_dir = get_log_dir(cfg.log_dir)
+#     # transforms = dm.val_dataloader().dataset.transforms
+#     transforms = hydra.utils.instantiate(dm.transforms)
+
+#     eval_libero = EvaluateLibero(
+#         model=model,
+#         transforms=transforms,
+#         log_dir=log_dir,
+#         benchmark_name=cfg.benchmark_name,
+#         num_sequences=cfg.num_sequences,
+#         num_videos=cfg.num_videos,
+#         max_steps=cfg.max_steps,
+#         n_eval=cfg.n_eval,
+#         task_embedding_format=cfg.task_embedding_format,
+#         device=cfg.device,
+#     )
+
+#     if cfg.log_wandb:
+#         os.makedirs(log_dir / "wandb", exist_ok=False)
+#         run = wandb.init(
+#             project='mode_libero_eval',
+#             entity=cfg.wandb_entity,
+#             config=OmegaConf.to_object(cfg),
+#         )
+  
+#     if cfg.log_wandb:
+#         run.finish()
 @hydra.main(config_path="../../conf", config_name="mode_evaluate_libero")
 def main(cfg):
     seed_everything(0, workers=True)
+
+    # 直接写死
+    train_folder = "/root/autodl-tmp/MoDE_Diffusion_Policy/logs/runs/2026-05-26/19-28-27"
+    checkpoint = "/root/autodl-tmp/MoDE_ckpts/best-epoch=18-val_act/lang_act_loss_pp=0.0207.ckpt"
+
+    print("train_folder =", train_folder)
+    print("checkpoint   =", checkpoint)
+    dbg("before get_default_mode_and_env")
     model, _, dm, _ = get_default_mode_and_env(
-        cfg.train_folder,
-        cfg.dataset_path,
-        cfg.checkpoint,
+        train_folder=train_folder,
+        dataset_path=cfg.dataset_path,
+        checkpoint=checkpoint,
         env=42,
         lang_embeddings=None,
         eval_cfg_overwrite=cfg.eval_cfg_overwrite,
         device_id=cfg.device,
-        prep_dm_and_deps=False
+        prep_dm_and_deps=False,
     )
-
+    dbg("after get_default_mode_and_env")
     model = model.to(cfg.device)
     model.eval()
-
     log_dir = get_log_dir(cfg.log_dir)
-    # transforms = dm.val_dataloader().dataset.transforms
     transforms = hydra.utils.instantiate(dm.transforms)
 
     eval_libero = EvaluateLibero(
@@ -335,22 +435,13 @@ def main(cfg):
         n_eval=cfg.n_eval,
         task_embedding_format=cfg.task_embedding_format,
         device=cfg.device,
+        plan_file=cfg.get("plan_file", ""),
     )
 
-    if cfg.log_wandb:
-        os.makedirs(log_dir / "wandb", exist_ok=False)
-        run = wandb.init(
-            project='mode_libero_eval',
-            entity=cfg.wandb_entity,
-            config=OmegaConf.to_object(cfg),
-        )
-
-    if cfg.log_wandb:
-        run.finish()
-
+    eval_libero.start()
 
 if __name__ == "__main__":
     # Set CUDA device IDs
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+    # os.environ["CUDA_VISIBLE_DEVICES"] = "4"
     main()

@@ -10,6 +10,10 @@ train_folder: /home/yagmurlu/code/MoDE_Diffusion_Policy/pretrained/
 checkpoint: libero_90=0
 device: 0
 
+# Path to the atomic-plan jsonl (same file used for training via
+# datamodule.plan_file). Leave empty to evaluate without plan fusion.
+plan_file: ""
+
 
 log_dir: /home/yagmurlu/code/MoDE_Diffusion_Policy/outputs/libero_90_test
 dataset_path: /home/yagmurlu/code/mdt_policy/dataset/calvin_debug_dataset
