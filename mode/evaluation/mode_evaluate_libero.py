@@ -268,8 +268,12 @@ class EvaluateLibero:
             steps = 0
             model.reset()
 
-            dbg(f"[{task_str}] before set_init_state")   
-            obs = env.set_init_state(init_states)
+            dbg(f"[{task_str}] before set_init_state")
+            # init_states has shape [N, state_dim]; a single (non-vectorized)
+            # OffScreenRenderEnv expects ONE flattened state, so pick the i-th
+            # init state (wrapping around if n_eval > number of init states).
+            init_state_i = init_states[i % len(init_states)]
+            obs = env.set_init_state(init_state_i)
             dbg(f"[{task_str}] after set_init_state")
 
             
