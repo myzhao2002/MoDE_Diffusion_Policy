@@ -53,7 +53,9 @@ logger:
   group: mode
   log_model: false
   project: ${libero_benchmark}
-  entity: omeryagmurlu
+  # entity removed: defaults to the entity of whatever wandb account is logged
+  # in on this machine (set via `wandb login` / WANDB_API_KEY). Re-add
+  # `entity: <your_wandb_username_or_team>` only if you need a specific one.
   id: ???
 
 

@@ -50,6 +50,15 @@ echo "pretrained=$PRETRAINED  shutdown_mode=$SHUTDOWN_MODE"
 echo "extra args: $*"
 echo "=================================================================="
 
+# ---- autodl academic acceleration (helps reach wandb.ai / github from CN) ---
+# Only when online wandb is requested; harmless if the file is absent.
+if [ -f /etc/network_turbo ]; then
+  # shellcheck disable=SC1091
+  source /etc/network_turbo && echo "[net] sourced /etc/network_turbo (academic acceleration on)"
+else
+  echo "[net] /etc/network_turbo not found -> skipping academic acceleration"
+fi
+
 # ---- conda env (nohup starts a non-interactive shell -> init manually) ------
 # shellcheck disable=SC1090
 source "$CONDA_SH"
@@ -57,7 +66,9 @@ conda activate "$CONDA_ENV"
 
 # ---- runtime env vars -------------------------------------------------------
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export WANDB_MODE=offline
+# WANDB_MODE: online (default, real-time upload) | offline | disabled.
+# Requires a logged-in account: `wandb login` once, or export WANDB_API_KEY.
+export WANDB_MODE="${WANDB_MODE:-online}"
 export PYTHONPATH="${PYTHONPATH:-}:$PROJECT_DIR/LIBERO:$PROJECT_DIR"
 
 cd "$PROJECT_DIR" || { echo "FATAL: cannot cd to $PROJECT_DIR"; exit 1; }
