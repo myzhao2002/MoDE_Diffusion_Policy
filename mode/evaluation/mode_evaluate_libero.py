@@ -175,15 +175,21 @@ class EvaluateLibero:
 
         result_array = sum(successes) / len(successes)
 
-        # print(f"number of rollouts: {len(successes)}")
-        log_print(f"eval_lh/avg_seq_len success rate {torch.tensor(result_array)}")
-        wandb.log("eval_lh/avg_seq_len", torch.tensor(result_array), on_epoch=True, sync_dist=True)
+        wandb_active = wandb.run is not None
+
+        print("\n========== LIBERO EVAL RESULTS ==========")
+        print(f"avg success rate: {result_array:.4f}  (over {len(successes)} tasks)")
+        log_print(f"eval_lh/avg_seq_len success rate {result_array:.4f}")
+        if wandb_active:
+            wandb.log({"eval_lh/avg_seq_len": result_array})
 
         for success, task_name in zip(successes, self.task_names):
+            print(f"  {task_name}: {success:.4f}")
             log_print(f"eval_lh/sr_{task_name} with success {success}")
-            wandb.log(f"eval_lh/sr_{task_name}", success, on_step=False, sync_dist=True)
+            if wandb_active:
+                wandb.log({f"eval_lh/sr_{task_name}": success})
+        print("========================================\n")
         print('done')
-        print()
 
     def evaluate_policy(self, model, store_video=False):
         successes = []
