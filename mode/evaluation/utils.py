@@ -18,6 +18,23 @@ hasher = pyhash.fnv1_32()
 logger = logging.getLogger(__name__)
 
 
+# PyTorch >= 2.6 changed the default of torch.load from weights_only=False to
+# weights_only=True. Lightning checkpoints created here pickle OmegaConf configs
+# (via save_hyperparameters), which are not allowed under weights_only=True and
+# raise an UnpicklingError. These checkpoints are user-trained and trusted, so we
+# restore the previous behaviour by defaulting weights_only=False when a caller
+# (e.g. Lightning's pl_load) does not set it explicitly.
+_ORIG_TORCH_LOAD = torch.load
+
+
+def _torch_load_weights_only_false(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _ORIG_TORCH_LOAD(*args, **kwargs)
+
+
+torch.load = _torch_load_weights_only_false
+
+
 def load_class(name):
     module_name, class_name = name.rsplit(".", 1)
     module = importlib.import_module(module_name)
