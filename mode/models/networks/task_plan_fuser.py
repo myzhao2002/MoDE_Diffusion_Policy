@@ -23,6 +23,13 @@ class TaskPlanFuser(nn.Module):
         if plan_emb.dim() == 3:
             plan_emb = plan_emb.squeeze(1)
 
+        # Align input dtype with the fuser weights. During eval the MoDE model is
+        # cast to half precision, but CLIP text embeddings stay float32, which
+        # would raise "mat1 and mat2 must have the same dtype" in the Linear layer.
+        target_dtype = self.net[0].weight.dtype
+        task_emb = task_emb.to(target_dtype)
+        plan_emb = plan_emb.to(target_dtype)
+
         fused = self.net(torch.cat([task_emb, plan_emb], dim=-1))
         return fused.unsqueeze(1)
 
