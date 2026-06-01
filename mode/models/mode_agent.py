@@ -304,6 +304,14 @@ class MoDEAgent(pl.LightningModule):
             optim_groups.extend([
                 {"params": self.perceiver.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
             ])
+        # IMPORTANT: include the task-plan fusion MLP in the optimizer. Without
+        # this it stays at its random init for the whole run (the fused goal
+        # embedding becomes a fixed random projection), so "plan fusion" never
+        # actually learns and eval rollouts collapse despite a low BC val loss.
+        if getattr(self, "use_plan_fusion", False) and getattr(self, "task_plan_fuser", None) is not None:
+            optim_groups.extend([
+                {"params": self.task_plan_fuser.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
+            ])
         optimizer = torch.optim.AdamW(optim_groups, lr=self.optimizer_config.learning_rate, betas=self.optimizer_config.betas)
         # Optionally initialize the scheduler 
         if self.use_lr_scheduler:
