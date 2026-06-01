@@ -1,5 +1,6 @@
 from collections import Counter
 from itertools import chain
+import json
 import logging
 import multiprocessing
 import os
@@ -149,7 +150,16 @@ class RolloutLibero(Callback):
         empty_cache,
         debug,
         device,
+        plan_file="",
     ):
+        # Task-Plan Fusion: load the same plan_text mapping used during training
+        # so the in-training rollout evaluates WITH plan fusion (consistent with
+        # the data module and the standalone eval). Without this the rollout
+        # silently falls back to the plain instruction embedding.
+        self.plan_file = plan_file
+        self.plan_by_task = {}
+        self._load_plan_mapping()
+
         self.device = device
         self.task_order = 0
         self.bddl_folder = get_libero_path("bddl_files")
@@ -195,6 +205,45 @@ class RolloutLibero(Callback):
             self.benchmark_instance.set_task_embs(task_embs)
 
         self.all_tasks = list(range(self.benchmark_instance.n_tasks))
+
+    def _load_plan_mapping(self):
+        """Load demo-basename -> plan_text mapping from the JSONL plan file.
+
+        Same keying as the data module / standalone eval: the JSONL `task`
+        field equals the demonstration file basename (e.g. "..._demo").
+        """
+        if not self.plan_file:
+            log_rank_0("[RolloutLibero] no plan_file given -> rollout runs WITHOUT plan fusion")
+            return
+        if not os.path.exists(self.plan_file):
+            log_rank_0(f"[RolloutLibero] plan_file not found: {self.plan_file}")
+            return
+        with open(self.plan_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                task = obj.get("task", "")
+                plan_text = obj.get("plan_text", "")
+                if task and plan_text:
+                    self.plan_by_task[task] = plan_text
+        log_rank_0(f"[RolloutLibero] loaded plan_text for {len(self.plan_by_task)} tasks")
+
+    def _resolve_plan_text(self, idx, fallback_lang):
+        """Resolve the atomic plan for task `idx` by its demo basename, falling
+        back to the instruction when no plan is available (matches training)."""
+        if not self.plan_by_task:
+            return None
+        try:
+            demo_path = self.benchmark_instance.get_task_demonstration(idx)
+            demo_name = os.path.splitext(os.path.basename(demo_path))[0]
+        except Exception:
+            return fallback_lang
+        return self.plan_by_task.get(demo_name, fallback_lang)
 
     def on_validation_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
         """Called when the validation loop begins."""
@@ -280,6 +329,22 @@ class RolloutLibero(Callback):
         # Calculate the number of evaluations for this GPU
         eval_loop_num = end_rollout - start_rollout
 
+        # Task-Plan Fusion: resolve the atomic plan for this task once, then feed
+        # it through process_env_obs so the rollout uses the fused goal embedding
+        # exactly like training. None -> no plan fusion (plain instruction).
+        plan_text = self._resolve_plan_text(idx, task_i.language)
+        if not getattr(self, "_dbg_plan_printed", False):
+            self._dbg_plan_printed = True
+            log_rank_0(
+                "[ROLLOUT-PLAN-DBG] use_plan_fusion=%s plan_matched=%s lang='%s' plan='%s'"
+                % (
+                    getattr(model, "use_plan_fusion", None),
+                    plan_text is not None and plan_text != task_i.language,
+                    task_i.language,
+                    str(plan_text)[:160],
+                )
+            )
+
         # initiate evaluation envs
         env_args = {
             "bddl_file_name": os.path.join(
@@ -349,7 +414,7 @@ class RolloutLibero(Callback):
 
             while steps < self.max_steps:
                 steps += 1
-                data, goal = self.process_env_obs(obs[0], task_emb, task_i.language)
+                data, goal = self.process_env_obs(obs[0], task_emb, task_i.language, plan_text)
                 # data = raw_obs_to_tensor_obs(obs, task_emb, cfg)
                 actions = model.step(data, goal).unsqueeze(0)
                 actions = actions.cpu().numpy()
@@ -420,13 +485,17 @@ class RolloutLibero(Callback):
 
         return data
 
-    def process_env_obs(self, env_obs, lang_embed, lang_text=None):
+    def process_env_obs(self, env_obs, lang_embed, lang_text=None, plan_text=None):
         return_obs = self.translate_obs_space(env_obs)
         return_obs = self.apply_transforms(return_obs)
 
         goal = {}
         goal['lang_text'] = lang_text
         goal['lang'] = lang_embed
+        # Only inject plan_text when we actually have one, so model.forward()
+        # takes the plan-fusion branch (it checks `"plan_text" in goal`).
+        if plan_text is not None:
+            goal['plan_text'] = plan_text
 
         return return_obs, goal
 

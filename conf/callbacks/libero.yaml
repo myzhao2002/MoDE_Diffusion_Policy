@@ -28,6 +28,10 @@ rollout_lh:
   use_mp: false
   task_embedding_format: clip
   device: ${device}
+  # Reuse the SAME plan file the data module loads, so the in-training rollout
+  # evaluates WITH plan fusion (consistent with training). Set via the existing
+  # `datamodule.plan_file=...` override — nothing extra to pass.
+  plan_file: ${datamodule.plan_file}
 
 
 checkpoint:
