@@ -19,9 +19,11 @@ from mode.utils.lr_schedulers.tri_stage_scheduler import TriStageLRScheduler
 from mode.callbacks.ema import EMA
 from mode.models.perceptual_encoders.resnets import ResNetEncoderWithFiLM
 from mode.models.perceptual_encoders.pretrained_resnets import FiLMResNet34Policy, FiLMResNet50Policy
-from mode.models.networks.modedit import NoiseBlockMoE 
+from mode.models.networks.modedit import NoiseBlockMoE
 from mode.utils.lang_buffer import AdvancedLangEmbeddingBuffer
 from mode.models.networks.task_plan_fuser import TaskPlanFuser
+from mode.models.perceptual_encoders.dino_encoder import DinoV2Encoder
+from mode.models.networks.lang_perceiver import LangPerceiver
 
 
 logger = logging.getLogger(__name__)
@@ -70,31 +72,55 @@ class MoDEAgent(pl.LightningModule):
         use_text_not_embedding: bool = True,
         use_proprio: bool = False,
         act_window_size: int = 10,
-        resnet_type: str = '18', 
+        resnet_type: str = '18',
         use_plan_fusion: bool = True,
         plan_fuser_hidden_dim: int = 512,
         plan_fuser_dropout: float = 0.1,
+        use_dino: bool = False,
+        dino_model_name: str = 'dinov2_vitb14',
+        num_visual_latents: int = 4,
+        visual_latent_dim: int = 512,
+        perceiver_depth: int = 2,
     ):
         super(MoDEAgent, self).__init__()
-        # Set obs_dim based on resnet_type
-        obs_dim = 2048 if resnet_type == '50' else 512
+        # Set obs_dim: DINO+Perceiver outputs `visual_latent_dim` tokens; the
+        # ResNet path keeps the original resnet-type-dependent dim.
+        self.use_dino = use_dino
+        if use_dino:
+            obs_dim = visual_latent_dim
+        else:
+            obs_dim = 2048 if resnet_type == '50' else 512
         self.latent_dim = latent_dim
         model.inner_model.obs_dim = obs_dim
         self.model = hydra.utils.instantiate(model).to(self.device)
 
-        # Select ResNet type based on parameter
-        if resnet_type == '18':
-            ResNetClass = ResNetEncoderWithFiLM  # You'll need to import this
-        elif resnet_type == '34':
-            ResNetClass = FiLMResNet34Policy
-        elif resnet_type == '50':
-            ResNetClass = FiLMResNet50Policy
+        if use_dino:
+            # Frozen DINOv2 backbone shared by both cameras + per-camera
+            # language(plan)-conditioned Perceiver heads.
+            self.dino = DinoV2Encoder(model_name=dino_model_name, freeze=True, clip_norm_input=True)
+            self.static_perceiver = LangPerceiver(
+                media_dim=self.dino.embed_dim, dim=visual_latent_dim,
+                num_latents=num_visual_latents, depth=perceiver_depth, cond_dim=cond_dim,
+            )
+            self.gripper_perceiver = LangPerceiver(
+                media_dim=self.dino.embed_dim, dim=visual_latent_dim,
+                num_latents=num_visual_latents, depth=perceiver_depth, cond_dim=cond_dim,
+            )
+            self.use_film_resnet = False
         else:
-            raise ValueError(f"Unsupported ResNet type: {resnet_type}")
-        self.static_resnet = ResNetClass(cond_dim)
-        self.gripper_resnet = ResNetClass(cond_dim)
+            # Select ResNet type based on parameter
+            if resnet_type == '18':
+                ResNetClass = ResNetEncoderWithFiLM  # You'll need to import this
+            elif resnet_type == '34':
+                ResNetClass = FiLMResNet34Policy
+            elif resnet_type == '50':
+                ResNetClass = FiLMResNet50Policy
+            else:
+                raise ValueError(f"Unsupported ResNet type: {resnet_type}")
+            self.static_resnet = ResNetClass(cond_dim)
+            self.gripper_resnet = ResNetClass(cond_dim)
+            self.use_film_resnet = True
         self.use_perceiver = use_perceiver
-        self.use_film_resnet = True
         self.use_text_not_embedding = use_text_not_embedding
         self.act_window_size = act_window_size
         self.seed = seed
@@ -296,10 +322,17 @@ class MoDEAgent(pl.LightningModule):
         #optim_groups = [
         #    {"params": self.model.inner_model.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
         # ]
-        optim_groups.extend([
-            {"params": self.static_resnet.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
-            {"params": self.gripper_resnet.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
-        ])
+        if self.use_dino:
+            # DINO backbone is frozen; only the per-camera Perceiver heads train.
+            optim_groups.extend([
+                {"params": self.static_perceiver.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
+                {"params": self.gripper_perceiver.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
+            ])
+        else:
+            optim_groups.extend([
+                {"params": self.static_resnet.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
+                {"params": self.gripper_resnet.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
+            ])
         if self.use_perceiver:
             optim_groups.extend([
                 {"params": self.perceiver.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
@@ -554,34 +587,65 @@ class MoDEAgent(pl.LightningModule):
         """
         # 1. extract the revelant visual observations
         latent_goal = None
-        # last images are the randomly sampled future goal images for models learned with image goals 
+        # last images are the randomly sampled future goal images for models learned with image goals
         rgb_static = dataset_batch["rgb_obs"]['rgb_static'] # [:, :-1]
         rgb_gripper = dataset_batch["rgb_obs"]['rgb_gripper'] #[:, :-1]
+        plan_text = dataset_batch.get("plan_text", None)
 
-        if self.use_text_not_embedding:
-            plan_text = dataset_batch.get("plan_text", None)
-            if self.use_plan_fusion and plan_text is not None:
-                latent_goal = self._compute_fused_goal_embedding(dataset_batch["lang_text"], plan_text).to(rgb_static.dtype)
+        if self.use_dino:
+            # goal slot = task instruction only; the whole plan conditions the
+            # visual Perceiver (language queries the DINO patches).
+            latent_goal = self.lang_buffer.get_goal_instruction_embeddings(dataset_batch["lang_text"]).to(rgb_static.dtype)
+            if plan_text is not None:
+                vis_cond = self.lang_buffer.get_goal_instruction_embeddings(plan_text).to(rgb_static.dtype)
             else:
-                latent_goal = self.lang_buffer.get_goal_instruction_embeddings(dataset_batch["lang_text"]).to(rgb_static.dtype)
+                vis_cond = latent_goal
+            perceptual_emb = self.embed_visual_obs(rgb_static, rgb_gripper, vis_cond)
         else:
-            latent_goal = self.language_goal(dataset_batch["lang"]).to(rgb_static.dtype)
+            if self.use_text_not_embedding:
+                if self.use_plan_fusion and plan_text is not None:
+                    latent_goal = self._compute_fused_goal_embedding(dataset_batch["lang_text"], plan_text).to(rgb_static.dtype)
+                else:
+                    latent_goal = self.lang_buffer.get_goal_instruction_embeddings(dataset_batch["lang_text"]).to(rgb_static.dtype)
+            else:
+                latent_goal = self.language_goal(dataset_batch["lang"]).to(rgb_static.dtype)
 
-        perceptual_emb = self.embed_visual_obs(rgb_static, rgb_gripper, latent_goal)
+            perceptual_emb = self.embed_visual_obs(rgb_static, rgb_gripper, latent_goal)
 
         if self.use_proprio:
             perceptual_emb['robot_obs'] = dataset_batch['robot_obs']
         
         return perceptual_emb, latent_goal
     
-    def embed_visual_obs(self, rgb_static, rgb_gripper, latent_goal):
+    def embed_visual_obs(self, rgb_static, rgb_gripper, cond):
+        # `cond` is the conditioning vector: the FiLM goal for the ResNet path,
+        # or the plan embedding (perceiver query bias) for the DINO path.
+        b = rgb_static.shape[0]
         # reshape rgb_static and rgb_gripper
         rgb_static = einops.rearrange(rgb_static, 'b t c h w -> (b t) c h w')
         rgb_gripper = einops.rearrange(rgb_gripper, 'b t c h w -> (b t) c h w')
 
+        if self.use_dino:
+            # DINO patch tokens, then language(plan)-conditioned Perceiver.
+            bt = rgb_static.shape[0]
+            if cond.dim() == 3:
+                cond = cond.squeeze(1)
+            if cond.shape[0] != bt:  # repeat cond across the obs time steps
+                cond = cond.repeat_interleave(bt // cond.shape[0], dim=0)
+            cond = cond.to(self.static_perceiver.lang_proj.weight.dtype)
+
+            static_patches = self.dino(rgb_static)    # [bt, Ns, Ddino]
+            gripper_patches = self.dino(rgb_gripper)   # [bt, Ng, Ddino]
+            static_tokens = self.static_perceiver(static_patches, cond)    # [bt, k, d]
+            gripper_tokens = self.gripper_perceiver(gripper_patches, cond)  # [bt, k, d]
+            static_tokens = einops.rearrange(static_tokens, '(b t) k d -> b (t k) d', b=b)
+            gripper_tokens = einops.rearrange(gripper_tokens, '(b t) k d -> b (t k) d', b=b)
+            token_seq = torch.cat([static_tokens, gripper_tokens], dim=1)
+            return {'state_images': token_seq}
+
         if self.use_film_resnet:
-            static_tokens = self.static_resnet(rgb_static, latent_goal)
-            gripper_tokens = self.gripper_resnet(rgb_gripper, latent_goal)
+            static_tokens = self.static_resnet(rgb_static, cond)
+            gripper_tokens = self.gripper_resnet(rgb_gripper, cond)
         else:
             static_tokens = self.static_resnet(rgb_static)
             gripper_tokens = self.gripper_resnet(rgb_gripper)
@@ -614,7 +678,15 @@ class MoDEAgent(pl.LightningModule):
         """
         Method for doing inference with the model.
         """
-        if self.use_text_not_embedding:
+        vis_cond = None
+        if self.use_dino:
+            # goal slot = task only; plan conditions the visual Perceiver.
+            latent_goal = self.lang_buffer.get_goal_instruction_embeddings(goal["lang_text"]).to(torch.float32)
+            if "plan_text" in goal:
+                vis_cond = self.lang_buffer.get_goal_instruction_embeddings(goal["plan_text"]).to(torch.float32)
+            else:
+                vis_cond = latent_goal
+        elif self.use_text_not_embedding:
             if self.use_plan_fusion and "plan_text" in goal:
                 latent_goal = self._compute_fused_goal_embedding(goal["lang_text"], goal["plan_text"]).to(torch.float32)
             else:
@@ -624,12 +696,12 @@ class MoDEAgent(pl.LightningModule):
         if self.need_precompute_experts_for_inference:
             self.precompute_expert_for_inference(latent_goal)
             self.need_precompute_experts_for_inference = False
-        
+
 
         rgb_static = obs["rgb_obs"]['rgb_static']
         rgb_gripper = obs["rgb_obs"]['rgb_gripper']
 
-        perceptual_emb = self.embed_visual_obs(rgb_static, rgb_gripper, latent_goal)
+        perceptual_emb = self.embed_visual_obs(rgb_static, rgb_gripper, vis_cond if self.use_dino else latent_goal)
         
         act_seq = self.denoise_actions(
             torch.zeros_like(latent_goal).to(latent_goal.device),
@@ -676,11 +748,15 @@ class MoDEAgent(pl.LightningModule):
     def on_train_start(self)-> None:
         
         self.model.to(dtype=self.dtype)
-        self.static_resnet.to(dtype=self.dtype)
-        self.gripper_resnet.to(dtype=self.dtype)
-        # self.perceiver.to(dtype=self.dtype)
+        if self.use_dino:
+            self.dino.to(dtype=self.dtype)
+            self.static_perceiver.to(dtype=self.dtype)
+            self.gripper_perceiver.to(dtype=self.dtype)
+        else:
+            self.static_resnet.to(dtype=self.dtype)
+            self.gripper_resnet.to(dtype=self.dtype)
         # self.language_goal.to(dtype=self.dtype)
-        
+
         for idx, callback in enumerate(self.trainer.callbacks):
             if isinstance(callback, EMA):
                 self.ema_callback_idx = idx
@@ -892,9 +968,13 @@ class MoDEAgent(pl.LightningModule):
     def on_train_start(self)-> None:
         
         self.model.to(dtype=self.dtype)
-        self.static_resnet.to(dtype=self.dtype)
-        self.gripper_resnet.to(dtype=self.dtype)
-        # self.perceiver.to(dtype=self.dtype)
+        if self.use_dino:
+            self.dino.to(dtype=self.dtype)
+            self.static_perceiver.to(dtype=self.dtype)
+            self.gripper_perceiver.to(dtype=self.dtype)
+        else:
+            self.static_resnet.to(dtype=self.dtype)
+            self.gripper_resnet.to(dtype=self.dtype)
         self.language_goal.to(dtype=torch.float32)
 
 @rank_zero_only

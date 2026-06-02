@@ -142,12 +142,29 @@ class LiberoDataModule(pl.LightningDataModule):
         self.plan_by_task = {}
         self._load_plan_mapping()
 
+    def _resolve_plan_file(self):
+        """Resolve plan_file, tolerating Hydra changing the working directory.
+
+        If the given path is not found (e.g. relative path + Hydra chdir to the
+        run dir), fall back to resolving it against the repo root (two levels up
+        from this file).
+        """
+        if os.path.exists(self.plan_file):
+            return self.plan_file
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        candidate = os.path.join(repo_root, os.path.basename(self.plan_file))
+        if os.path.exists(candidate):
+            return candidate
+        return None
+
     def _load_plan_mapping(self):
         if not self.plan_file:
             return
-        if not os.path.exists(self.plan_file):
+        resolved = self._resolve_plan_file()
+        if resolved is None:
             print(f"[LiberoDataModule] plan_file not found: {self.plan_file}")
             return
+        self.plan_file = resolved
 
         with open(self.plan_file, "r", encoding="utf-8") as f:
             for line in f:
@@ -179,70 +196,67 @@ class LiberoDataModule(pl.LightningDataModule):
         # self.libero_observation_space['modality']['depth'] = []
         self.libero_observation_space['low_dim'] = obs_space['state_obs']
 
+    def _parse_benchmark_names(self):
+        """Allow benchmark_name to be a single name or a comma-separated list.
+
+        For "全集" training we point this at the four base suites
+        (libero_spatial, libero_object, libero_goal, libero_10) which together
+        make up the 40 tasks covered by the plan file.
+        """
+        raw = self.benchmark_name
+        if isinstance(raw, (list, tuple)):
+            names = list(raw)
+        else:
+            names = [n.strip() for n in str(raw).split(",")]
+        return [n for n in names if n]
+
     def _initialize_datasets(self, datasets_cfg):
         self.translate_obs_space(datasets_cfg.lang_dataset.obs_space)
 
-        benchmark_name = self.benchmark_name
-        benchmark_instance = get_benchmark(benchmark_name)()
-        num_tasks = benchmark_instance.get_num_tasks()
+        benchmark_names = self._parse_benchmark_names()
         datasets_default_path = datasets_cfg.get('custom_data_path', get_libero_path("datasets"))
 
         train_datasets = []
         val_datasets = []
-        descriptions = []
 
-        for i in range(num_tasks):
-            dataset_path = os.path.join(datasets_default_path, benchmark_instance.get_task_demonstration(i))
-            task_name = os.path.splitext(os.path.basename(dataset_path))[0]
+        # Global task counter so obs-utils is initialized exactly once, on the
+        # very first task across all benchmarks.
+        global_task_idx = 0
 
-            # for image and language goals, for now lets just use language since mode doesn't deal with image yet?
-            # task_i_dataset, shape_meta = get_split_dataset(
-            #     dataset_path=dataset_path,
-            #     obs_modality=self.libero_observation_space,
-            #     initialize_obs_utils=(i == 0),
-            #     seq_len=datasets_cfg.lang_dataset.action_seq_len,
-            #     split_ratio=self.split_ratio
-            # )
-            task_i_dataset, shape_meta = get_dataset(
-                dataset_path=dataset_path,
-                obs_modality=self.libero_observation_space,
-                initialize_obs_utils=(i == 0),
-                seq_len=datasets_cfg.lang_dataset.action_seq_len,
-            )
-            descriptions.append(benchmark_instance.get_task(i).language)
+        for benchmark_name in benchmark_names:
+            benchmark_instance = get_benchmark(benchmark_name)()
+            num_tasks = benchmark_instance.get_num_tasks()
+            descriptions = []
 
-            task_embs = get_task_embs(self.cfg, descriptions)
-            benchmark_instance.set_task_embs(task_embs)
-            # vl_img_dataset = TranslatedImgGoalSequenceVLDataset(
-            #     task_i_dataset[0],
-            #     task_embs[i],
-            #     act_seq_len=datasets_cfg.lang_dataset.action_seq_len,
-            #     obs_seq_len=datasets_cfg.lang_dataset.obs_seq_len,
-            #     transforms=self.transforms
-            # )
-            vl_dataset = TranslatedSequenceVLDataset(
-                # task_i_dataset[1],
-                task_i_dataset,
-                task_embs[i],
-                descriptions[i],
-                plan_text=self.plan_by_task.get(task_name, descriptions[i]),
-                act_seq_len=datasets_cfg.lang_dataset.action_seq_len,
-                obs_seq_len=datasets_cfg.lang_dataset.obs_seq_len,
-                transforms=self.transforms
-            )
+            for i in range(num_tasks):
+                dataset_path = os.path.join(datasets_default_path, benchmark_instance.get_task_demonstration(i))
+                task_name = os.path.splitext(os.path.basename(dataset_path))[0]
 
-            # Split dataset into training and validation based on trajectory indices
-            # train_sequences = [task_i_dataset[j] for j in train_indices]
-            # val_sequences = [task_i_dataset[j] for j in val_indices]
-            # Split each dataset
-            # dataset_size = len(vl_dataset)
-            # train_size = int(train_ratio * dataset_size)
-            # val_size = dataset_size - train_size
+                task_i_dataset, shape_meta = get_dataset(
+                    dataset_path=dataset_path,
+                    obs_modality=self.libero_observation_space,
+                    initialize_obs_utils=(global_task_idx == 0),
+                    seq_len=datasets_cfg.lang_dataset.action_seq_len,
+                )
+                global_task_idx += 1
+                descriptions.append(benchmark_instance.get_task(i).language)
 
-            # train_dataset, val_dataset = random_split(vl_dataset, [train_size, val_size])
-            # img_datasets.append(vl_img_dataset)
-            train_datasets.append(vl_dataset)
-            # val_datasets.append(vl_dataset)
+                task_embs = get_task_embs(self.cfg, descriptions)
+                benchmark_instance.set_task_embs(task_embs)
+                vl_dataset = TranslatedSequenceVLDataset(
+                    task_i_dataset,
+                    task_embs[i],
+                    descriptions[i],
+                    plan_text=self.plan_by_task.get(task_name, descriptions[i]),
+                    act_seq_len=datasets_cfg.lang_dataset.action_seq_len,
+                    obs_seq_len=datasets_cfg.lang_dataset.obs_seq_len,
+                    transforms=self.transforms
+                )
+
+                train_datasets.append(vl_dataset)
+
+        print(f"[LiberoDataModule] built {len(train_datasets)} task datasets "
+              f"from benchmarks: {benchmark_names}")
 
         # Concatenate all training and validation datasets
         # concat_img_datasets = ConcatDataset(img_datasets)

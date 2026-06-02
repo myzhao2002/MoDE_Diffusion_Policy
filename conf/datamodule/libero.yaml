@@ -8,7 +8,9 @@ root_data_dir: ${root_data_dir}
 action_space: 7
 shuffle_val: false
 benchmark_name: ${libero_benchmark}
-plan_file: ""
+# 40-task atomic plans covering the four base suites. Resolved against the repo
+# root if the working dir changes (see LiberoDataModule._resolve_plan_file).
+plan_file: "plans_libero_all_tasks.jsonl"
 
 observation_space:
   rgb_obs: ["agentview_rgb", "eye_in_hand_rgb"]

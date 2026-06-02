@@ -21,6 +21,16 @@ obs_enc_dim: ${obs_dim}
 cond_dim: 512
 resnet_type: '50'
 
+# --- DINOv2 + language(plan) cross-attention visual frontend ---
+# When use_dino=True the FiLM-ResNet is replaced by a frozen DINOv2 backbone
+# whose patch tokens are cross-attended by the whole-plan embedding (LangPerceiver).
+# The goal slot then carries the task instruction ONLY; the plan goes into vision.
+use_dino: False
+dino_model_name: 'dinov2_vitb14'   # dinov2_vits14 / dinov2_vitb14 / dinov2_vitl14
+num_visual_latents: 4              # visual tokens per camera (k)
+visual_latent_dim: 512             # perceiver working/output dim = obs_dim
+perceiver_depth: 2
+
 optimizer:
   _target_: torch.optim.AdamW
   transformer_weight_decay: 0.05

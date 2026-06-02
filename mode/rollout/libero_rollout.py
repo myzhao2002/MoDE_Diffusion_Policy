@@ -165,7 +165,21 @@ class RolloutLibero(Callback):
         self.bddl_folder = get_libero_path("bddl_files")
         self.init_states_folder = get_libero_path("init_states")
         self.task_embedding_format =task_embedding_format
-        self.benchmark_name = benchmark_name
+        # benchmark_name may be a comma-separated list (used for "全集" training
+        # across the four base suites). The periodic in-training rollout is only
+        # a smoke test, so we evaluate on the FIRST listed suite here; run the
+        # standalone eval script for full multi-suite evaluation.
+        if isinstance(benchmark_name, (list, tuple)):
+            _bench_list = list(benchmark_name)
+        else:
+            _bench_list = [n.strip() for n in str(benchmark_name).split(",") if n.strip()]
+        if len(_bench_list) > 1:
+            log_rank_0(
+                f"[RolloutLibero] multiple benchmarks given {_bench_list}; "
+                f"in-training rollout will evaluate ONLY '{_bench_list[0]}' "
+                f"(use the standalone eval for all suites)."
+            )
+        self.benchmark_name = _bench_list[0]
         self.benchmark_dict = benchmark.get_benchmark_dict()
         self.benchmark_instance = self.benchmark_dict[self.benchmark_name]()
         self.num_tasks = self.benchmark_instance.get_num_tasks()
@@ -216,8 +230,13 @@ class RolloutLibero(Callback):
             log_rank_0("[RolloutLibero] no plan_file given -> rollout runs WITHOUT plan fusion")
             return
         if not os.path.exists(self.plan_file):
-            log_rank_0(f"[RolloutLibero] plan_file not found: {self.plan_file}")
-            return
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            candidate = os.path.join(repo_root, os.path.basename(self.plan_file))
+            if os.path.exists(candidate):
+                self.plan_file = candidate
+            else:
+                log_rank_0(f"[RolloutLibero] plan_file not found: {self.plan_file}")
+                return
         with open(self.plan_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
