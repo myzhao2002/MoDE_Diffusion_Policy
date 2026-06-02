@@ -16,7 +16,9 @@ rollout_lh:
   env_cfg:
     _target_: mode.wrappers.hulc_wrapper.HulcWrapper
   skip_epochs: ${rollout_lh_skip_epochs}
-  benchmark_name: ${libero_benchmark}
+  # 训练用全集(libero_benchmark)，但训练内 rollout 只评估 rollout_benchmark(默认 libero_10)。
+  # Training uses the full suite; the in-training rollout only evaluates rollout_benchmark.
+  benchmark_name: ${rollout_benchmark}
   rollout_freq: 10
   num_videos: 0
   num_sequences: 50 # 128
