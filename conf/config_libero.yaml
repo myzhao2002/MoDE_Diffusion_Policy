@@ -27,7 +27,7 @@ act_seq_len: 10
 multistep: ${act_seq_len}
 p_last_state: 0
 gen_img_res: 112
-max_epochs: 20
+max_epochs: 45  # 对齐 lr_scheduler.total_steps=45000 (1000 steps/epoch)，让余弦衰减完整跑完。Align with scheduler total_steps so the cosine LR decay finishes.
 rollout_lh_skip_epochs: 9
 num_workers: 1
 benchmark_name: ${libero_benchmark}

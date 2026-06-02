@@ -37,6 +37,10 @@ optimizer:
   obs_encoder_weight_decay: 0.05
   learning_rate: 1e-4
   betas: [0.9, 0.95]
+  # lr multiplier applied to from-scratch visual modules (DINO Perceivers +
+  # tok_emb + plan fuser) so they catch up with the warm-started transformer.
+  # 1.0 = no boost. Only active on the DINO path. Override via CLI if needed.
+  visual_lr_scale: 3.0
 
 lr_scheduler:
   lr_scheduler:

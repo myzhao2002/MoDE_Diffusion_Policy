@@ -137,6 +137,11 @@ class MoDEAgent(pl.LightningModule):
         )
         self.modality_scope = "lang"
         self.optimizer_config = optimizer
+        # lr multiplier for from-scratch visual modules (DINO Perceivers + tok_emb +
+        # plan fuser). They start random while the transformer is warm-started, so a
+        # higher lr helps them catch up. 1.0 = no boost. See configure_optimizers.
+        self.visual_lr_scale = float(optimizer.get("visual_lr_scale", 1.0)) \
+            if hasattr(optimizer, "get") else getattr(optimizer, "visual_lr_scale", 1.0)
         self.lr_scheduler = lr_scheduler
         self.entropy_gamma = entropy_gamma
         self.router_z_delta = router_z_delta
@@ -324,9 +329,11 @@ class MoDEAgent(pl.LightningModule):
         # ]
         if self.use_dino:
             # DINO backbone is frozen; only the per-camera Perceiver heads train.
+            # They start from random init -> boosted lr (visual_lr_scale) to catch
+            # up with the warm-started transformer.
             optim_groups.extend([
-                {"params": self.static_perceiver.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
-                {"params": self.gripper_perceiver.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
+                {"params": self.static_perceiver.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay, "lr_scale": self.visual_lr_scale},
+                {"params": self.gripper_perceiver.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay, "lr_scale": self.visual_lr_scale},
             ])
         else:
             optim_groups.extend([
@@ -342,8 +349,9 @@ class MoDEAgent(pl.LightningModule):
         # embedding becomes a fixed random projection), so "plan fusion" never
         # actually learns and eval rollouts collapse despite a low BC val loss.
         if getattr(self, "use_plan_fusion", False) and getattr(self, "task_plan_fuser", None) is not None:
+            # plan fuser is also random-init -> boosted lr.
             optim_groups.extend([
-                {"params": self.task_plan_fuser.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
+                {"params": self.task_plan_fuser.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay, "lr_scale": self.visual_lr_scale},
             ])
         optimizer = torch.optim.AdamW(optim_groups, lr=self.optimizer_config.learning_rate, betas=self.optimizer_config.betas)
         # Optionally initialize the scheduler 
@@ -426,12 +434,20 @@ class MoDEAgent(pl.LightningModule):
         def use_weight_decay(name):
             return all(x not in name for x in ['bias', 'LayerNorm', 'embedding'])
 
-        # Split parameters into two groups
+        visual_lr_scale = getattr(self, "visual_lr_scale", 1.0)
+
+        # Split parameters into groups
         decay = []
         no_decay = []
-        
+        visual_decay = []  # from-scratch tok_emb (DINO path) -> boosted lr
+
         for name, param in self.model.inner_model.named_parameters():
-            if use_weight_decay(name):
+            # tok_emb projects the visual tokens (obs_dim) -> embed_dim. Under
+            # use_dino its shape changed (2048->512) so it is NOT loaded from the
+            # pretrained ckpt -> trained from scratch -> give it the visual lr boost.
+            if self.use_dino and name.startswith("tok_emb"):
+                visual_decay.append(param)
+            elif use_weight_decay(name):
                 decay.append(param)
             else:
                 no_decay.append(param)
@@ -440,6 +456,12 @@ class MoDEAgent(pl.LightningModule):
             {"params": decay, "weight_decay": self.optimizer_config.transformer_weight_decay},
             {"params": no_decay, "weight_decay": 0.0}
         ]
+        if visual_decay:
+            optim_groups.append(
+                {"params": visual_decay,
+                 "weight_decay": self.optimizer_config.transformer_weight_decay,
+                 "lr_scale": visual_lr_scale}
+            )
         return optim_groups
 
     def training_step(self, batch: Dict[str, Dict], batch_idx: int) -> torch.Tensor:

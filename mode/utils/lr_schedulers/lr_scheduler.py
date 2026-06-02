@@ -40,8 +40,12 @@ class LearningRateScheduler(_LRScheduler):
 
     @staticmethod
     def set_lr(optimizer, lr):
+        # Per-group lr multiplier: a param group may carry an "lr_scale" key to
+        # train at a multiple of the scheduled base lr (e.g. from-scratch visual
+        # modules learn faster than the warm-started transformer). Defaults to 1.0
+        # so existing single-lr behaviour is unchanged.
         for g in optimizer.param_groups:
-            g["lr"] = lr
+            g["lr"] = lr * g.get("lr_scale", 1.0)
 
     def get_lr(self):
         for g in self.optimizer.param_groups:
