@@ -19,8 +19,37 @@ Notes
 * First run needs internet to fetch the hub repo + weights (on autodl enable
   `/etc/network_turbo`). Afterwards it is cached under TORCH_HOME.
 """
+import os
+
 import torch
 import torch.nn as nn
+
+
+def _load_dino_backbone(model_name: str):
+    """Load a DINOv2 backbone, preferring the OFFLINE torch.hub cache.
+
+    `torch.hub.load("facebookresearch/dinov2", ...)` reaches github.com to
+    validate the repo even when the repo + weights are already cached, so it
+    fails on offline boxes (e.g. autodl without `source /etc/network_turbo`).
+    We therefore try the local cached repo first (no network), and only fall
+    back to the online fetch when the cache is missing.
+    """
+    hub_dir = torch.hub.get_dir()
+    local_repo = os.path.join(hub_dir, "facebookresearch_dinov2_main")
+
+    # 1) Offline path: cached repo dir exists -> load with source="local".
+    if os.path.isdir(local_repo):
+        try:
+            return torch.hub.load(
+                local_repo, model_name, source="local", trust_repo=True
+            )
+        except Exception:
+            pass  # fall through to the online attempt
+
+    # 2) Online path: fetch the repo (and weights) from github / fbaipublicfiles.
+    return torch.hub.load(
+        "facebookresearch/dinov2", model_name, trust_repo=True
+    )
 
 
 # CLIP normalization stats used by the existing data transforms.
@@ -40,14 +69,13 @@ class DinoV2Encoder(nn.Module):
     ):
         super().__init__()
         try:
-            self.model = torch.hub.load(
-                "facebookresearch/dinov2", model_name, trust_repo=True
-            )
+            self.model = _load_dino_backbone(model_name)
         except Exception as e:
             raise RuntimeError(
                 f"Failed to load DINOv2 '{model_name}' via torch.hub. The first "
-                f"run needs internet (on autodl run `source /etc/network_turbo`). "
-                f"Original error: {e}"
+                f"run needs internet (on autodl run `source /etc/network_turbo`) "
+                f"to populate the cache under {torch.hub.get_dir()}; afterwards it "
+                f"loads offline. Original error: {e}"
             )
 
         self.embed_dim = self.model.embed_dim  # 384 (S), 768 (B), 1024 (L)
