@@ -20,9 +20,9 @@ plan_file: /root/autodl-tmp/LIBERO-datasets/plans_libero_all_tasks.jsonl
 
 log_dir: /root/autodl-tmp/MoDE_Diffusion_Policy/outputs/libero_eval
 dataset_path: /root/autodl-tmp/MoDE_Diffusion_Policy/dataset/calvin_debug_dataset
-# 每个 task 只存前 N 个 rollout 的视频(0=完全不存)。原来是 30,会把每个
-# task 的 20 个 rollout 全存成 mp4(40 任务=800 个),太占盘。改成 2。
-# 想看更多就 CLI 覆盖,例如 num_videos=5;一个都不要就 num_videos=0。
+# 每个 task 最多保存 N 个【失败】rollout 的视频(0=完全不存)。只录失败的,
+# 成功的不存,方便排查;每个 task 存满 N 个失败视频就不再存。文件名形如
+# rollout_<task>_FAIL_0.mp4。想多看就 CLI 覆盖 num_videos=5。
 num_videos: 2
 debug: False
 

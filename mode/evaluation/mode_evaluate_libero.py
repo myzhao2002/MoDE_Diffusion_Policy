@@ -280,14 +280,12 @@ class EvaluateLibero:
                 )
 
         num_success = 0
+        num_failed_videos = 0  # 本 task 已保存的“失败 rollout”视频数,上限 store_video
         for i in tqdm(range(self.n_eval), desc="Evaluating"):
-            store_video_this_rollout = i < store_video
-            if store_video_this_rollout:
-                video_frames = []
-                video_filename = f"rollout_{task_str}_nmp_{i}.mp4"
-                video_path = os.path.join(self.log_dir, video_filename)
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec for MP4
-                video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (self.img_w, self.img_h))
+            # 成功与否要等 rollout 跑完才知道,所以只要本 task 还没存够失败视频,
+            # 就先把帧缓存到内存,结束时只对“失败(done=False)”的 rollout 落盘。
+            record_this_rollout = num_failed_videos < store_video
+            video_frames = [] if record_this_rollout else None
             dbg(f"[{task_str}] before env.reset")
             env.reset()
             dbg(f"[{task_str}] after env.reset")
@@ -332,16 +330,23 @@ class EvaluateLibero:
                     )
                 obs, reward, done, info = env.step(actions)
 
-                if store_video_this_rollout:
+                if record_this_rollout:
                     video_frames.append(obs['agentview_image'])
 
                 if done:
                     break
 
-            if store_video_this_rollout:
+            # 只保存失败的 rollout(done=False),每个 task 最多 store_video 个。
+            if record_this_rollout and not done:
+                video_filename = f"rollout_{task_str}_FAIL_{num_failed_videos}.mp4"
+                video_path = os.path.join(self.log_dir, video_filename)
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec for MP4
+                video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (self.img_w, self.img_h))
                 for frame in video_frames:
                     video_writer.write(frame)
                 video_writer.release()
+                num_failed_videos += 1
+                dbg(f"[{task_str}] saved FAILURE video -> {video_filename}")
 
             # a new form of success record
             # 每个 rollout 结束打一行明确结果:成功 True / 失败 False。
