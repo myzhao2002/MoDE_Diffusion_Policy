@@ -253,6 +253,13 @@ class EvaluateLibero:
         matched = demo_name in self.plan_by_task
         plan_text = self.plan_by_task.get(demo_name, task_i.language)
 
+        # 用任务的自然语言描述生成安全文件名片段(失败视频命名用),例如
+        # "pick up the black bowl ... on the plate" -> "pick_up_the_black_bowl_..._on_the_plate"
+        _slug = "".join(c if c.isalnum() else "_" for c in str(task_i.language).strip().lower())
+        while "__" in _slug:
+            _slug = _slug.replace("__", "_")
+        task_desc_slug = _slug.strip("_")[:80] or task_str
+
         # ---- one-shot diagnostics to verify train/eval consistency ----
         log_print(f"[PLAN-DBG] task={task_str} demo_name={demo_name} plan_matched={matched}")
         log_print(f"[PLAN-DBG]   lang_text='{task_i.language}'")
@@ -337,8 +344,9 @@ class EvaluateLibero:
                     break
 
             # 只保存失败的 rollout(done=False),每个 task 最多 store_video 个。
+            # 文件名 = 任务自然语言描述 + FAIL 标记 + 序号。
             if record_this_rollout and not done:
-                video_filename = f"rollout_{task_str}_FAIL_{num_failed_videos}.mp4"
+                video_filename = f"{task_desc_slug}_FAIL_{num_failed_videos}.mp4"
                 video_path = os.path.join(self.log_dir, video_filename)
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec for MP4
                 video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (self.img_w, self.img_h))
