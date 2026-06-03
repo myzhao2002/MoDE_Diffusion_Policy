@@ -6,17 +6,20 @@ eval_cfg_overwrite:
   model:
     num_sampling_steps: 10
 
-train_folder: /home/yagmurlu/code/MoDE_Diffusion_Policy/pretrained/
-checkpoint: libero_90=0
+# 训练 run 的 hydra 输出目录(含 .hydra/config.yaml，模型按它重建，会带上 use_dino=True)。
+# 开机后用 `ls logs/runs/2026-06-02/` 找到本次训练的实际时间戳目录，改这里。
+train_folder: /root/autodl-tmp/MoDE_Diffusion_Policy/logs/runs/2026-06-02/18-37-07
+# 权重文件绝对路径。last.ckpt = 训练最后一轮(save_last)，文件名固定、最稳。
+# 想用按 val_act 选出的 best，换成 MoDE_ckpts/best-epoch=XX-val_act/lang_act_loss_pp=0.XXXX.ckpt
+checkpoint: /root/autodl-tmp/MoDE_ckpts/last.ckpt
 device: 0
 
-# Path to the atomic-plan jsonl (same file used for training via
-# datamodule.plan_file). Leave empty to evaluate without plan fusion.
-plan_file: ""
+# 原子计划 jsonl(必须和训练用的同一个，训练开了 plan fusion，eval 也要开才一致)。
+plan_file: /root/autodl-tmp/LIBERO-datasets/plans_libero_all_tasks.jsonl
 
 
-log_dir: /home/yagmurlu/code/MoDE_Diffusion_Policy/outputs/libero_90_test
-dataset_path: /home/yagmurlu/code/mdt_policy/dataset/calvin_debug_dataset
+log_dir: /root/autodl-tmp/MoDE_Diffusion_Policy/outputs/libero_eval
+dataset_path: /root/autodl-tmp/MoDE_Diffusion_Policy/dataset/calvin_debug_dataset
 num_videos: 30
 debug: False
 
@@ -35,4 +38,6 @@ max_steps: 520
 n_eval: 20
 task_embedding_format: clip
 
-benchmark_name: libero_90 # [LIBERO_SPATIAL, LIBERO_OBJECT, LIBERO_GOAL, LIBERO_90, LIBERO_10]
+# 全集 = 训练用的四个基础套件(40 任务)。逗号分隔，main() 会逐套件评测再汇总。
+# 想只评单套件就填一个，例如 libero_10。
+benchmark_name: libero_spatial,libero_object,libero_goal,libero_10 # [libero_spatial, libero_object, libero_goal, libero_10, libero_90]

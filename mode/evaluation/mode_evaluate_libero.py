@@ -454,9 +454,11 @@ class EvaluateLibero:
 def main(cfg):
     seed_everything(0, workers=True)
 
-    # 直接写死
-    train_folder = "/root/autodl-tmp/MoDE_Diffusion_Policy/logs/runs/2026-05-26/19-28-27"
-    checkpoint = "/root/autodl-tmp/MoDE_ckpts/best-epoch=18-val_act/lang_act_loss_pp=0.0207.ckpt"
+    # train_folder = 训练 run 的 hydra 输出目录(含 .hydra/config.yaml)，模型按它
+    # 重建(所以会带上 use_dino=True 等本次训练的标志)；checkpoint = 权重文件绝对路径。
+    # 二者现在从配置读取(conf/mode_evaluate_libero.yaml)，也可用 CLI 覆盖。
+    train_folder = cfg.train_folder
+    checkpoint = cfg.checkpoint
 
     print("train_folder =", train_folder)
     print("checkpoint   =", checkpoint)
@@ -477,21 +479,41 @@ def main(cfg):
     log_dir = get_log_dir(cfg.log_dir)
     transforms = hydra.utils.instantiate(dm.transforms)
 
-    eval_libero = EvaluateLibero(
-        model=model,
-        transforms=transforms,
-        log_dir=log_dir,
-        benchmark_name=cfg.benchmark_name,
-        num_sequences=cfg.num_sequences,
-        num_videos=cfg.num_videos,
-        max_steps=cfg.max_steps,
-        n_eval=cfg.n_eval,
-        task_embedding_format=cfg.task_embedding_format,
-        device=cfg.device,
-        plan_file=cfg.get("plan_file", ""),
-    )
+    # benchmark_name 可以是单个套件，也可以是逗号分隔的列表(全集 40 任务 =
+    # libero_spatial,libero_object,libero_goal,libero_10)。逐套件评测再汇总。
+    benchmark_names = [b.strip() for b in str(cfg.benchmark_name).split(",") if b.strip()]
 
-    eval_libero.start()
+    all_successes = []
+    per_suite = {}
+    for bench in benchmark_names:
+        log_print(f"\n########## Evaluating benchmark: {bench} ##########")
+        eval_libero = EvaluateLibero(
+            model=model,
+            transforms=transforms,
+            log_dir=log_dir,
+            benchmark_name=bench,
+            num_sequences=cfg.num_sequences,
+            num_videos=cfg.num_videos,
+            max_steps=cfg.max_steps,
+            n_eval=cfg.n_eval,
+            task_embedding_format=cfg.task_embedding_format,
+            device=cfg.device,
+            plan_file=cfg.get("plan_file", ""),
+        )
+        successes = eval_libero.evaluate_policy(model, store_video=cfg.num_videos)
+        suite_avg = sum(successes) / len(successes) if successes else 0.0
+        per_suite[bench] = (suite_avg, len(successes))
+        print(f"\n=== {bench} avg success: {suite_avg:.4f} over {len(successes)} tasks ===")
+        for s, tn in zip(successes, eval_libero.task_names):
+            print(f"  [{bench}] {tn}: {s:.4f}")
+            all_successes.append(s)
+
+    overall = sum(all_successes) / len(all_successes) if all_successes else 0.0
+    print("\n========== OVERALL (all suites) ==========")
+    for bench, (avg, n) in per_suite.items():
+        print(f"  {bench:18s}: {avg:.4f}  ({n} tasks)")
+    print(f"  {'OVERALL':18s}: {overall:.4f}  ({len(all_successes)} tasks)")
+    print("==========================================\n")
 
 if __name__ == "__main__":
     # Set CUDA device IDs
