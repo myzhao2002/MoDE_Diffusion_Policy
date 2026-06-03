@@ -316,8 +316,10 @@ class EvaluateLibero:
 
             while steps < self.max_steps:
                 steps += 1
-                if steps % 20 == 0:
-                    dbg(f"[{task_str}] rollout={i+1} step={steps} done={done}")
+                # 仅作长 rollout 的心跳打印,不再刷 done=False(成功那一步在
+                # env.step 后才置 True 并立刻 break,根本轮不到这里打印)。
+                if steps % 100 == 0:
+                    dbg(f"[{task_str}] rollout={i+1} running... step={steps}")
                 data, goal = self.process_env_obs(obs, task_emb, task_i.language, plan_text)
                 # data = raw_obs_to_tensor_obs(obs, task_emb, cfg)
                 actions = model.step(data, goal)
@@ -342,6 +344,8 @@ class EvaluateLibero:
                 video_writer.release()
 
             # a new form of success record
+            # 每个 rollout 结束打一行明确结果:成功 True / 失败 False。
+            dbg(f"[{task_str}] rollout={i+1} RESULT success={bool(done)} (steps={steps})")
             num_success += int(done)
 
 
