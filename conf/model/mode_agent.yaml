@@ -31,6 +31,20 @@ num_visual_latents: 4              # visual tokens per camera (k)
 visual_latent_dim: 512             # perceiver working/output dim = obs_dim
 perceiver_depth: 2
 
+# --- 实验四: FiLM-ResNet + plan 交叉注意力 (use_dino=False 时生效) ---
+# 保留 FiLM-ResNet50(OXE warm-start + FiLM 语言注入),并在其 layer4 patch tokens
+# 之上叠加一个 plan-as-query 的 LangPerceiver。每相机 = 1 个 pooled(全局)token +
+# resnet_xattn_latents 个 plan 选中的(局部)token,输出维度=obs_dim(2048),复用
+# warm-started tok_emb -> 零接口侵入。plan 走 xattn query,goal 走 FiLM(task 或
+# 开了 use_plan_fusion 的 fused)。这是把"实验三的冻结 DINO"换回"带 OXE 预训练的
+# ResNet"的对照实验。
+# Keep FiLM-ResNet50 (OXE warm-start) and add a plan-queried cross-attention head
+# over its layer4 patches. Per camera: 1 pooled token + resnet_xattn_latents plan
+# tokens. The exp3 DINO frontend swapped for the OXE-pretrained ResNet.
+use_resnet_xattn: False
+resnet_xattn_latents: 4     # plan-queried tokens per camera (besides the pooled token)
+resnet_xattn_depth: 1       # perceiver depth (kept shallow: from-scratch on limited LIBERO data)
+
 optimizer:
   _target_: torch.optim.AdamW
   transformer_weight_decay: 0.05

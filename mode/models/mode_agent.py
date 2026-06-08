@@ -81,6 +81,9 @@ class MoDEAgent(pl.LightningModule):
         num_visual_latents: int = 4,
         visual_latent_dim: int = 512,
         perceiver_depth: int = 2,
+        use_resnet_xattn: bool = False,
+        resnet_xattn_latents: int = 4,
+        resnet_xattn_depth: int = 1,
     ):
         super(MoDEAgent, self).__init__()
         # Set obs_dim: DINO+Perceiver outputs `visual_latent_dim` tokens; the
@@ -120,6 +123,23 @@ class MoDEAgent(pl.LightningModule):
             self.static_resnet = ResNetClass(cond_dim)
             self.gripper_resnet = ResNetClass(cond_dim)
             self.use_film_resnet = True
+            # --- 实验四: FiLM-ResNet + plan 交叉注意力 ---
+            # 保留 FiLM-ResNet50(OXE warm-start),在其 layer4 patch tokens 之上叠加
+            # 一个 plan-as-query 的 LangPerceiver。输出维度 = obs_dim(2048),与原
+            # warm-started tok_emb 完全兼容 -> 零接口侵入、满血 warm-start,新增的只有
+            # 这两个 perceiver 头(从零训,给 lr boost)。
+            if use_resnet_xattn:
+                assert resnet_type == '50', \
+                    "use_resnet_xattn 目前假设 ResNet50(2048-d 特征)"
+                self.static_xattn = LangPerceiver(
+                    media_dim=obs_dim, dim=obs_dim,
+                    num_latents=resnet_xattn_latents, depth=resnet_xattn_depth, cond_dim=cond_dim,
+                )
+                self.gripper_xattn = LangPerceiver(
+                    media_dim=obs_dim, dim=obs_dim,
+                    num_latents=resnet_xattn_latents, depth=resnet_xattn_depth, cond_dim=cond_dim,
+                )
+        self.use_resnet_xattn = bool(use_resnet_xattn) and not use_dino
         self.use_perceiver = use_perceiver
         self.use_text_not_embedding = use_text_not_embedding
         self.act_window_size = act_window_size
@@ -340,6 +360,12 @@ class MoDEAgent(pl.LightningModule):
                 {"params": self.static_resnet.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
                 {"params": self.gripper_resnet.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
             ])
+            # plan cross-attention heads are random-init -> boosted lr (visual_lr_scale).
+            if getattr(self, "use_resnet_xattn", False):
+                optim_groups.extend([
+                    {"params": self.static_xattn.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay, "lr_scale": self.visual_lr_scale},
+                    {"params": self.gripper_xattn.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay, "lr_scale": self.visual_lr_scale},
+                ])
         if self.use_perceiver:
             optim_groups.extend([
                 {"params": self.perceiver.parameters(), "weight_decay": self.optimizer_config.transformer_weight_decay},
@@ -632,16 +658,22 @@ class MoDEAgent(pl.LightningModule):
             else:
                 latent_goal = self.language_goal(dataset_batch["lang"]).to(rgb_static.dtype)
 
-            perceptual_emb = self.embed_visual_obs(rgb_static, rgb_gripper, latent_goal)
+            # FiLM-ResNet + xattn: goal 走 FiLM(task 或 fused),plan 单独当 xattn query。
+            vis_cond = None
+            if getattr(self, "use_resnet_xattn", False) and plan_text is not None:
+                vis_cond = self.lang_buffer.get_goal_instruction_embeddings(plan_text).to(rgb_static.dtype)
+            perceptual_emb = self.embed_visual_obs(rgb_static, rgb_gripper, latent_goal, vis_cond)
 
         if self.use_proprio:
             perceptual_emb['robot_obs'] = dataset_batch['robot_obs']
         
         return perceptual_emb, latent_goal
     
-    def embed_visual_obs(self, rgb_static, rgb_gripper, cond):
+    def embed_visual_obs(self, rgb_static, rgb_gripper, cond, vis_cond=None):
         # `cond` is the conditioning vector: the FiLM goal for the ResNet path,
         # or the plan embedding (perceiver query bias) for the DINO path.
+        # `vis_cond` is the plan embedding used as the cross-attention query in
+        # the FiLM-ResNet + xattn path (DINO path ignores it: it queries with cond).
         b = rgb_static.shape[0]
         # reshape rgb_static and rgb_gripper
         rgb_static = einops.rearrange(rgb_static, 'b t c h w -> (b t) c h w')
@@ -664,6 +696,27 @@ class MoDEAgent(pl.LightningModule):
             gripper_tokens = einops.rearrange(gripper_tokens, '(b t) k d -> b (t k) d', b=b)
             token_seq = torch.cat([static_tokens, gripper_tokens], dim=1)
             return {'state_images': token_seq}
+
+        if self.use_film_resnet and getattr(self, "use_resnet_xattn", False):
+            # FiLM-ResNet (OXE warm-start, language via FiLM) + plan-queried
+            # cross-attention over layer4 patch tokens. Per camera the policy gets
+            # 1 pooled (global) token + k plan-selected (local) tokens, all 2048-d
+            # so they share the warm-started tok_emb.
+            q = vis_cond if vis_cond is not None else cond
+            if q.dim() == 3:
+                q = q.squeeze(1)
+            bt = rgb_static.shape[0]
+            if q.shape[0] != bt:  # repeat plan across the obs time steps
+                q = q.repeat_interleave(bt // q.shape[0], dim=0)
+            q = q.to(self.static_xattn.lang_proj.weight.dtype)
+
+            s_pooled, s_patches = self.static_resnet(rgb_static, cond, return_patches=True)
+            g_pooled, g_patches = self.gripper_resnet(rgb_gripper, cond, return_patches=True)
+            s_tok = torch.cat([s_pooled.unsqueeze(1), self.static_xattn(s_patches, q)], dim=1)
+            g_tok = torch.cat([g_pooled.unsqueeze(1), self.gripper_xattn(g_patches, q)], dim=1)
+            s_tok = einops.rearrange(s_tok, '(b t) n d -> b (t n) d', b=b)
+            g_tok = einops.rearrange(g_tok, '(b t) n d -> b (t n) d', b=b)
+            return {'state_images': torch.cat([s_tok, g_tok], dim=1)}
 
         if self.use_film_resnet:
             static_tokens = self.static_resnet(rgb_static, cond)
@@ -723,7 +776,15 @@ class MoDEAgent(pl.LightningModule):
         rgb_static = obs["rgb_obs"]['rgb_static']
         rgb_gripper = obs["rgb_obs"]['rgb_gripper']
 
-        perceptual_emb = self.embed_visual_obs(rgb_static, rgb_gripper, vis_cond if self.use_dino else latent_goal)
+        # FiLM-ResNet + xattn inference: plan 当 xattn query。
+        if getattr(self, "use_resnet_xattn", False) and not self.use_dino and "plan_text" in goal:
+            vis_cond = self.lang_buffer.get_goal_instruction_embeddings(goal["plan_text"]).to(torch.float32)
+
+        perceptual_emb = self.embed_visual_obs(
+            rgb_static, rgb_gripper,
+            vis_cond if self.use_dino else latent_goal,
+            vis_cond=None if self.use_dino else vis_cond,
+        )
         
         act_seq = self.denoise_actions(
             torch.zeros_like(latent_goal).to(latent_goal.device),
@@ -777,6 +838,9 @@ class MoDEAgent(pl.LightningModule):
         else:
             self.static_resnet.to(dtype=self.dtype)
             self.gripper_resnet.to(dtype=self.dtype)
+            if getattr(self, "use_resnet_xattn", False):
+                self.static_xattn.to(dtype=self.dtype)
+                self.gripper_xattn.to(dtype=self.dtype)
         # self.language_goal.to(dtype=self.dtype)
 
         for idx, callback in enumerate(self.trainer.callbacks):
@@ -997,6 +1061,9 @@ class MoDEAgent(pl.LightningModule):
         else:
             self.static_resnet.to(dtype=self.dtype)
             self.gripper_resnet.to(dtype=self.dtype)
+            if getattr(self, "use_resnet_xattn", False):
+                self.static_xattn.to(dtype=self.dtype)
+                self.gripper_xattn.to(dtype=self.dtype)
         self.language_goal.to(dtype=torch.float32)
 
 @rank_zero_only

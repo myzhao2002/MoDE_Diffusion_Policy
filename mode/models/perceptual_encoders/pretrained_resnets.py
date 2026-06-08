@@ -34,7 +34,7 @@ class FiLMResNet50Policy(nn.Module):
         self.film3 = FiLMLayer(1024, condition_dim)
         self.film4 = FiLMLayer(2048, condition_dim)
 
-    def forward(self, x, condition):
+    def forward(self, x, condition, return_patches=False):
         if len(condition.shape) == 3:
             condition = condition.squeeze(1)
         x = self.resnet.conv1(x)
@@ -52,12 +52,16 @@ class FiLMResNet50Policy(nn.Module):
         x = self.film3(x, condition)
 
         x = self.resnet.layer4(x)
-        x = self.film4(x, condition)
+        feat = self.film4(x, condition)  # (B, 2048, H, W) language-modulated feature map
 
-        x = self.resnet.global_pool(x)
-        x = x.flatten(1)
+        pooled = self.resnet.global_pool(feat).flatten(1)  # (B, 2048) global token
+        if return_patches:
+            # spatial patch tokens for downstream plan cross-attention:
+            # (B, 2048, H, W) -> (B, H*W, 2048). static 224 -> 7x7=49, gripper 112 -> 4x4=16.
+            patches = feat.flatten(2).transpose(1, 2).contiguous()
+            return pooled, patches
 
-        return x  # Return the latent features directly
+        return pooled  # Return the latent features directly
 
 
 class FiLMResNet34Policy(nn.Module):
