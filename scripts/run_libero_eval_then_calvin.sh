@@ -7,6 +7,10 @@
 #   calvin_env play_table_env.py:72 已打补丁、calvin_vyoj/{training,validation}/.hydra/merged_config.yaml 已生成。
 set -u
 cd /root/autodl-tmp/MoDE_Diffusion_Policy
+# activate the lerobot conda env (script may be launched from base)
+source /root/miniconda3/etc/profile.d/conda.sh 2>/dev/null || true
+conda activate lerobot 2>/dev/null || true
+echo "python: $(which python)"
 source /etc/network_turbo 2>/dev/null || true
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export WANDB_MODE=online
