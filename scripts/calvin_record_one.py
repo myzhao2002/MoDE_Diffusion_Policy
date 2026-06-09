@@ -105,10 +105,9 @@ def main():
     # 5) 模拟 trainer 把 dataloaders 暴露给 callback
     class _FakeTrainer:
         callbacks = []
-        val_dataloaders = val_dataloaders
-        def __init__(self): pass
 
     fake_trainer = _FakeTrainer()
+    fake_trainer.val_dataloaders = val_dataloaders
     # 6) 触发 rollout(on_validation_start 内做 env 创建 + rollout)
     print(f"[record-one] starting {args.num_sequences} rollout(s) with video recording ...")
     rollout.on_validation_start(fake_trainer, model)
