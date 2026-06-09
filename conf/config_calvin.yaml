@@ -31,6 +31,7 @@ rollout_lh_skip_epochs: 9
 num_workers: 12
 benchmark_name: calvin_abc # calvin_abcd
 use_extracted_rel_actions: true
+plan_file: ""   # CALVIN 原子 plan jsonl;CLI 覆盖 plan_file=/path/plans_calvin.jsonl 启用 plan 注入
 
 trainer:
   devices: ${devices}

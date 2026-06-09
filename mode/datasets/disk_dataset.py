@@ -169,6 +169,7 @@ class ExtendedDiskDataset(DiskDataset):
         future_range: int,
         use_extracted_rel_actions: bool = False,
         extracted_dir: str = 'extracted/',
+        plan_file: str = "",
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
@@ -190,7 +191,39 @@ class ExtendedDiskDataset(DiskDataset):
                 # key: int, original episode fn's index; value: int, extracted npy's inner index
             self.extracted_ep_rel_actions: np.ndarray = np.load(os.path.join(self.extracted_dir, "ep_rel_actions.npy"))
             logger.info(f"Extracted files loaded from {self.extracted_dir}")
-        
+
+        # --- atomic plan injection (CALVIN), keyed by task label ---
+        # plan_file: jsonl with {"task": <label>, "plan_text": <"Approach(...) -> ...">}.
+        # lang_task holds the per-annotation task label (parallel to self.lang_text),
+        # loaded from the SAME (possibly filtered) lang folder as _build_file_indices_lang.
+        self.plan_by_task: Dict[str, str] = {}
+        self.lang_task = None
+        if getattr(self, "with_lang", False) and plan_file:
+            import json
+            try:
+                _ld = np.load(self.abs_datasets_dir / self.lang_folder / "auto_lang_ann.npy",
+                              allow_pickle=True).item()
+            except Exception:
+                _ld = np.load(self.abs_datasets_dir / "auto_lang_ann.npy", allow_pickle=True).item()
+            self.lang_task = _ld["language"]["task"]
+            pf = Path(plan_file)
+            if pf.exists():
+                with open(pf, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            o = json.loads(line)
+                        except Exception:
+                            continue
+                        t, pt = o.get("task", ""), o.get("plan_text", "")
+                        if t and pt:
+                            self.plan_by_task[t] = pt
+                logger.info(f"[ExtendedDiskDataset] loaded plan_text for {len(self.plan_by_task)} tasks from {pf}")
+            else:
+                logger.warning(f"[ExtendedDiskDataset] plan_file not found: {pf}")
+
     def find_sequence_boundaries(self, idx: int) -> Tuple[int, int]:
         for start_idx, end_idx in self.ep_start_end_ids:
             if start_idx <= idx < end_idx:
@@ -243,7 +276,9 @@ class ExtendedDiskDataset(DiskDataset):
         if self.with_lang:
             episode["language"] = self.lang_ann[self.lang_lookup[idx]][0]  # TODO check  [0]
             episode["language_text"] = self.lang_text[self.lang_lookup[idx]] #[0]  # TODO check  [0]
-        
+            if self.plan_by_task and self.lang_task is not None:
+                task = self.lang_task[self.lang_lookup[idx]]
+                episode["plan_text"] = self.plan_by_task.get(task, episode["language_text"])
 
         return episode
        

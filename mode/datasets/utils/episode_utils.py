@@ -152,6 +152,8 @@ def process_language(episode: Dict[str, np.ndarray], transforms: Dict, with_lang
             lang = transforms["language"](lang)
         seq_lang["lang"] = lang
         seq_lang['lang_text']  = episode['language_text']
+        if 'plan_text' in episode:
+            seq_lang['plan_text'] = episode['plan_text']
     return seq_lang
 
 
