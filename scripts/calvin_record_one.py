@@ -113,13 +113,23 @@ def main():
     rollout.on_validation_start(fake_trainer, model)
     results = rollout.evaluate_policy(model)
     print(f"[record-one] rollout results (subtasks completed per sequence): {results}")
-    # 7) flush videos
-    if rollout.rollout_video is not None:
-        rollout.rollout_video.write_to_tmp()
+    # 7) flush videos — RolloutLongHorizon 自身不会落盘视频(它走 wandb tmp 路径);
+    #    我们脱离 trainer,直接调 _log_videos_to_file 写 mp4 到 --save_dir。
+    if rollout.rollout_video is not None and len(rollout.rollout_video.videos) > 0:
+        rv = rollout.rollout_video
+        # 强制 mp4(默认 gif)
+        rv._log_videos_to_file(global_step=0, save_as_video=True)
+        rv.videos = []
+        rv.tags = []
+        rv.captions = []
 
     print(f"\n[record-one] videos saved under: {args.save_dir}")
-    for p in sorted(Path(args.save_dir).rglob("*.mp4")):
-        print("  ", p)
+    files = sorted(Path(args.save_dir).rglob("*"))
+    if not files:
+        print("  (empty — see [WARN] above if any)")
+    for p in files:
+        if p.is_file():
+            print(f"  {p}  ({p.stat().st_size/1024:.1f} KB)")
 
 
 if __name__ == "__main__":
