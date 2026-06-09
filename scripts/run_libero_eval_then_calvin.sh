@@ -9,7 +9,7 @@ set -u
 cd /root/autodl-tmp/MoDE_Diffusion_Policy
 source /etc/network_turbo 2>/dev/null || true
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export WANDB_MODE=offline
+export WANDB_MODE=online
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PYTHONPATH=$PYTHONPATH:/root/autodl-tmp/MoDE_Diffusion_Policy/LIBERO:/root/autodl-tmp/MoDE_Diffusion_Policy
@@ -36,6 +36,7 @@ python mode/training_calvin.py \
   callbacks.rollout_lh.num_sequences=200 \
   devices=1 batch_size=32 trainer.strategy=auto trainer.sync_batchnorm=False \
   max_epochs=20 \
+  logger.entity=null \
   hydra.run.dir=/root/autodl-tmp/MoDE_ckpts/calvin_exp4_${TS} \
   2>&1 | tee /root/autodl-tmp/train_calvin_exp4_${TS}.log
 echo "[2/2] CALVIN train+eval done ($(date))"
