@@ -16,7 +16,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export WANDB_MODE=online
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export PYTHONPATH=$PYTHONPATH:/root/autodl-tmp/MoDE_Diffusion_Policy/LIBERO:/root/autodl-tmp/MoDE_Diffusion_Policy
+export PYTHONPATH=${PYTHONPATH:-}:/root/autodl-tmp/MoDE_Diffusion_Policy/LIBERO:/root/autodl-tmp/MoDE_Diffusion_Policy
 TS=$(date +%Y%m%d_%H%M%S)
 
 echo "==================== [1/2] LIBERO exp4 full eval ($(date)) ===================="
