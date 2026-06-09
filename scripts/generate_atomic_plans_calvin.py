@@ -224,7 +224,13 @@ def plan_to_text(plan_obj: dict) -> str:
 
 def load_calvin_tasks(train_dir: Path):
     """Return list of (task_label, instruction_text, rep_frame_index) for each
-    UNIQUE CALVIN task label, read from training/lang_annotations/auto_lang_ann.npy."""
+    UNIQUE CALVIN task label, read from training/lang_annotations/auto_lang_ann.npy.
+
+    NOTE: the VyoJ subset ships the FULL auto_lang_ann.npy (global frame indices
+    spanning the whole ABCD_D), but only a SLICE of episode_*.npz files is present.
+    So we pick, per task, an annotation whose start frame actually EXISTS in this
+    subset; if a task has none in-range, we fall back to any present frame (the
+    plan is a per-task-type template, the image is only scene context)."""
     ann_path = train_dir / "lang_annotations" / "auto_lang_ann.npy"
     if not ann_path.exists():
         ann_path = train_dir / "auto_lang_ann.npy"
@@ -233,14 +239,21 @@ def load_calvin_tasks(train_dir: Path):
     anns = data["language"]["ann"]
     indx = data["info"]["indx"]  # list of (start, end) frame ranges, parallel to tasks/anns
 
+    # frames that actually exist in this subset
+    present = set(int(p.name.split("_")[1].split(".")[0]) for p in train_dir.glob("episode_*.npz"))
+    any_present = min(present) if present else 0
+
     seen = {}
     for i, t in enumerate(tasks):
-        if t in seen:
-            continue
         start = int(indx[i][0])
-        seen[t] = (str(anns[i]), start)
-    out = [(t, instr, start) for t, (instr, start) in seen.items()]
-    print(f"[CALVIN] {len(tasks)} annotations, {len(out)} unique task labels")
+        if t not in seen:
+            seen[t] = [str(anns[i]), start if start in present else None]
+        elif seen[t][1] is None and start in present:
+            seen[t][1] = start
+    out = [(t, instr, (start if start is not None else any_present))
+           for t, (instr, start) in seen.items()]
+    print(f"[CALVIN] {len(tasks)} annotations, {len(out)} unique tasks, "
+          f"{len(present)} episode files present")
     return out
 
 
