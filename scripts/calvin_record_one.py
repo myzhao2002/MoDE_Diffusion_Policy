@@ -73,9 +73,11 @@ def main():
 
     # 3) 重建一个 dataset(rollout 只用它拿 abs_datasets_dir / lang_folder,不真训)
     cfg.datamodule.root_data_dir = args.root_data_dir
-    cfg.lang_folder = cfg.lang_folder  # 沿用训练用的(lang_filtered)
-    if "_recursive_" in cfg.datamodule:
-        del cfg.datamodule["_recursive_"]
+    # HulcDataModule.setup() 自己用 datasets_dir 显式 instantiate datasets,所以这里
+    # 必须 _recursive_=False,否则 hydra 会先尝试 instantiate dataset、缺 datasets_dir。
+    from omegaconf import OmegaConf as _OC
+    _OC.set_struct(cfg.datamodule, False)
+    cfg.datamodule._recursive_ = False
     datamodule = hydra.utils.instantiate(cfg.datamodule, num_workers=0)
     datamodule.setup()
     val_dataloaders = datamodule.val_dataloader()
