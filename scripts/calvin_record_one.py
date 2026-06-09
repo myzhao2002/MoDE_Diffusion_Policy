@@ -84,10 +84,11 @@ def main():
     dataset = (val_dataloaders["lang"] if isinstance(val_dataloaders, dict)
                else val_dataloaders[0]).dataset
 
-    # 4) 构造 rollout callback(num_videos=1 / log_video_to_file=True / 1 序列)
-    rollout_cfg = OmegaConf.load(
-        Path(__file__).resolve().parents[1] / "conf/callbacks/rollout_lh/calvin.yaml"
-    )
+    # 4) 构造 rollout callback —— 直接复用训练 run 已展开的 rollout_lh 子树
+    #    (yaml 里有 defaults:,直接 OmegaConf.load 那个 yaml 会把 defaults 当字段,
+    #    导致 instantiate 收到非法 kwarg。这里从训练 config 里拿已合成的版本。)
+    rollout_cfg = cfg.callbacks.rollout_lh
+    OmegaConf.set_struct(rollout_cfg, False)
     rollout_cfg.num_videos = args.num_sequences
     rollout_cfg.num_sequences = args.num_sequences
     rollout_cfg.skip_epochs = 0
