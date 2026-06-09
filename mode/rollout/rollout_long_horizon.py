@@ -117,6 +117,7 @@ class RolloutLongHorizon(Callback):
         empty_cache,
         val_annotations,
         debug,
+        plan_file="",
     ):
         super().__init__()
         self.env = None  # type: Any
@@ -138,6 +139,27 @@ class RolloutLongHorizon(Callback):
         self.eval_sequences = None
         self.val_annotations = val_annotations
         self.debug = debug
+        # atom plans keyed by CALVIN task label (== rollout subtask), for plan-conditioned eval
+        self.plan_by_task = {}
+        if plan_file:
+            import json as _json
+            import os as _os
+            if _os.path.exists(plan_file):
+                with open(plan_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            o = _json.loads(line)
+                        except Exception:
+                            continue
+                        t, pt = o.get("task", ""), o.get("plan_text", "")
+                        if t and pt:
+                            self.plan_by_task[t] = pt
+                log_print.info(f"[RolloutLongHorizon] loaded plan_text for {len(self.plan_by_task)} tasks from {plan_file}")
+            else:
+                log_print.warning(f"[RolloutLongHorizon] plan_file not found: {plan_file}")
 
     def on_validation_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
         """Called when the validation loop begins."""
@@ -300,6 +322,8 @@ class RolloutLongHorizon(Callback):
         # get language goal embedding
         goal = self.lang_embeddings.get_lang_goal(lang_annotation)
         goal['lang_text'] = lang_annotation
+        if self.plan_by_task:
+            goal['plan_text'] = self.plan_by_task.get(subtask, lang_annotation)
         model.reset()
         start_info = self.env.get_info()
         success = False

@@ -15,4 +15,5 @@ empty_cache: false
 log_video_to_file: False
 save_dir: ./videos
 lang_folder: ${lang_folder} # ${datamodule.datasets.lang_dataset.lang_folder}
+plan_file: ${plan_file}
 debug: false

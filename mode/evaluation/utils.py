@@ -276,13 +276,24 @@ def join_vis_lang(img, lang_text):
 
 class LangEmbeddings:
     def __init__(self, val_dataset_path, lang_folder, device=torch.device("cuda:0")):
-        embeddings = np.load(Path(val_dataset_path) / lang_folder / "embeddings.npy", allow_pickle=True).item()
-        # we want to get the embedding for full sentence, not just a task name
-        self.lang_embeddings = {v["ann"][0]: v["emb"] for k, v in embeddings.items()}
+        emb_path = Path(val_dataset_path) / lang_folder / "embeddings.npy"
+        if emb_path.exists():
+            embeddings = np.load(emb_path, allow_pickle=True).item()
+            # we want to get the embedding for full sentence, not just a task name
+            self.lang_embeddings = {v["ann"][0]: v["emb"] for k, v in embeddings.items()}
+        else:
+            # No precomputed embeddings (e.g. a filtered subset folder). The policy
+            # encodes language at runtime from goal['lang_text'] (use_text_not_embedding),
+            # so the precomputed 'lang' emb is unused — tolerate its absence.
+            self.lang_embeddings = {}
         self.device = device
 
     def get_lang_goal(self, task):
-        return {"lang": torch.from_numpy(self.lang_embeddings[task]).to(self.device).squeeze(0).float()}
+        emb = self.lang_embeddings.get(task)
+        if emb is None:
+            # rollout sets goal['lang_text']; the model encodes it via CLIP.
+            return {}
+        return {"lang": torch.from_numpy(emb).to(self.device).squeeze(0).float()}
 
 
 def imshow_tensor(window, img_tensor, wait=0, resize=True, keypoints=None, text=None):
