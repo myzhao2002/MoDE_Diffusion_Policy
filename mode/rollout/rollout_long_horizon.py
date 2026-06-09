@@ -247,10 +247,10 @@ class RolloutLongHorizon(Callback):
             for i in range(1, 6):
                 n_success = sum(count[j] for j in reversed(range(i, 6)))
                 sr = n_success / len(results)
-                pl_module.log(f"eval_lh/sr_chain_{i}", torch.tensor(sr), on_step=False, sync_dist=True)
+                pl_module.log(f"eval_lh/sr_chain_{i}", torch.tensor(sr, device=pl_module.device), on_step=False, sync_dist=True)
                 log_rank_0(f"{i} / 5 subtasks: {n_success} / {len(results)} sequences, SR: {sr * 100:.1f}%")
             avg_seq_len = np.mean(results)
-            pl_module.log("eval_lh/avg_seq_len", torch.tensor(avg_seq_len), on_epoch=True, sync_dist=True)
+            pl_module.log("eval_lh/avg_seq_len", torch.tensor(avg_seq_len, device=pl_module.device), on_epoch=True, sync_dist=True)
             log_rank_0(f"Average successful sequence length: {avg_seq_len:.1f}")
             print()
 
@@ -262,15 +262,15 @@ class RolloutLongHorizon(Callback):
         """Log zero metrics for skipped evaluations."""
         for i in range(1, 6):
             pl_module.log(
-                f"eval_lh/sr_chain_{i}", 
-                torch.tensor(0.0), 
-                on_step=False, 
+                f"eval_lh/sr_chain_{i}",
+                torch.tensor(0.0, device=pl_module.device),
+                on_step=False,
                 sync_dist=True
             )
         pl_module.log(
-            "eval_lh/avg_seq_len", 
-            torch.tensor(0.0), 
-            on_step=False, 
+            "eval_lh/avg_seq_len",
+            torch.tensor(0.0, device=pl_module.device),
+            on_step=False,
             sync_dist=True
         )
 
