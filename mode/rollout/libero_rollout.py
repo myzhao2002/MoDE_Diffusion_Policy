@@ -5,7 +5,7 @@ import logging
 import multiprocessing
 import os
 from typing import Any
-from time import time
+import time
 import gc
 
 
@@ -290,21 +290,29 @@ class RolloutLibero(Callback):
             #    pl_module.log(f"eval_lh/sr_chain_{i}", torch.tensor(0.0), on_step=False, sync_dist=True)
             pl_module.log("eval_lh/avg_seq_len", torch.tensor(0.0), on_step=False, sync_dist=True)
         elif pl_module.current_epoch == self.skip_epochs or ((pl_module.current_epoch - self.skip_epochs) >= 0 and (pl_module.current_epoch - self.skip_epochs) % self.rollout_freq == 0):
-            successes = self.evaluate_policy(pl_module)
+            # 训练内 rollout 仅作冒烟评测,绝不能因仿真环境异常(如 robosuite 控制器
+            # 配置缺失)杀掉整个训练。失败则打警告、记 0、继续训练;ckpt 仍按 val_loss 选。
+            try:
+                successes = self.evaluate_policy(pl_module)
 
-            successes = gather_results(successes)
-            # if rank == 0:  # Only rank 0 performs the final aggregation
-            result_array = sum(successes) / len(successes)
+                successes = gather_results(successes)
+                # if rank == 0:  # Only rank 0 performs the final aggregation
+                result_array = sum(successes) / len(successes)
 
-            # print(f"number of rollouts: {len(successes)}")
-            log_rank_0(f"eval_lh/avg_seq_len success rate {torch.tensor(result_array)}")
-            pl_module.log("eval_lh/avg_seq_len", torch.tensor(result_array), on_epoch=True, sync_dist=True)
+                # print(f"number of rollouts: {len(successes)}")
+                log_rank_0(f"eval_lh/avg_seq_len success rate {torch.tensor(result_array)}")
+                pl_module.log("eval_lh/avg_seq_len", torch.tensor(result_array), on_epoch=True, sync_dist=True)
 
-            for success, task_name in zip(successes, self.task_names):
-                log_rank_0(f"eval_lh/sr_{task_name} with success {success}")
-                pl_module.log(f"eval_lh/sr_{task_name}", success, on_step=False, sync_dist=True)
-            print('done')
-            print()
+                for success, task_name in zip(successes, self.task_names):
+                    log_rank_0(f"eval_lh/sr_{task_name} with success {success}")
+                    pl_module.log(f"eval_lh/sr_{task_name}", success, on_step=False, sync_dist=True)
+                print('done')
+                print()
+            except Exception as e:
+                import traceback
+                log_rank_0(f"[ROLLOUT-SKIP] 训练内 rollout 失败,跳过本次(训练继续): {e}")
+                log_rank_0(traceback.format_exc())
+                pl_module.log("eval_lh/avg_seq_len", torch.tensor(0.0), on_epoch=True, sync_dist=True)
 
     def evaluate_policy(self, model, store_video=False):
         # if not (dist.is_available() and dist.is_initialized()):
