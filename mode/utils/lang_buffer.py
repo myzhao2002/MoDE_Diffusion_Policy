@@ -8,6 +8,7 @@ class AdvancedLangEmbeddingBuffer:
         self.language_encoder = language_encoder
         self.goal_instruction_buffer_size = goal_instruction_buffer_size
         self.goal_instruction_buffer = OrderedDict()
+        self.plan_step_buffer = OrderedDict()  # 实验四 v2: 缓存分步规划 token [S, D]
         self.buffer_lock = threading.Lock()
 
     def get_or_encode_batch(self, texts):
@@ -48,6 +49,44 @@ class AdvancedLangEmbeddingBuffer:
 
     def get_goal_instruction_embeddings(self, goal_instructions):
         return self.get_or_encode_batch(goal_instructions)
+
+    def get_plan_step_embeddings(self, plans):
+        """实验四 v2 (方案三): 返回分步规划 token + padding mask。
+
+        每条 plan 按步切分独立 CLIP 编码(逐条缓存), 一个 batch 内补齐到
+        最长步数, 并给出 mask 让交叉注意力忽略 padding 步。
+
+        Args:
+            plans: plan 字符串 或 字符串列表
+        Returns:
+            tokens: [B, Smax, D] 分步规划 token (padding 处为 0)
+            mask:   [B, Smax]    1=有效步, 0=padding
+        """
+        if isinstance(plans, str):
+            plans = [plans]
+
+        step_embs = []
+        for plan in plans:
+            with self.buffer_lock:
+                cached = self.plan_step_buffer.get(plan, None)
+            if cached is None:
+                cached = self.language_encoder.encode_plan_steps(plan)  # [S, D]
+                with self.buffer_lock:
+                    if len(self.plan_step_buffer) >= self.goal_instruction_buffer_size:
+                        self.plan_step_buffer.popitem(last=False)
+                    self.plan_step_buffer[plan] = cached
+            step_embs.append(cached)
+
+        smax = max(e.shape[0] for e in step_embs)
+        d = step_embs[0].shape[1]
+        device = step_embs[0].device
+        dtype = step_embs[0].dtype
+        tokens = torch.zeros(len(step_embs), smax, d, device=device, dtype=dtype)
+        mask = torch.zeros(len(step_embs), smax, device=device, dtype=dtype)
+        for i, e in enumerate(step_embs):
+            tokens[i, :e.shape[0]] = e
+            mask[i, :e.shape[0]] = 1.0
+        return tokens, mask
 
     def clear_buffer(self):
         with self.buffer_lock:

@@ -1,3 +1,28 @@
+"""
+MoDEAgent — 本项目核心模型 (PyTorch Lightning Module)
+
+职责:
+  装配并协调所有子模块:
+    - 视觉编码器: FiLM-ResNet50 (或 DINOv2) × 2 (static + gripper 相机)
+    - 语言编码器: CLIP ViT-B/32 (冻结)
+    - Plan 融合: TaskPlanFuser (cat[z_task, z_plan] → goal)
+    - Plan 交叉注意力: LangPerceiver × 2 (实验四, plan 查询 ResNet patch)
+    - 扩散主干: MoDeDiT (DiT + MoE, 按噪声σ路由)
+    - 采样器: EDM + 10步 DDIM
+
+序列构成 (实验四):
+  [σ_token(1) | goal_token(1) | state_tokens(10) | action_tokens(10)] = 22 token, 1024-d
+  其中 state_tokens: 每相机 1 pooled + 4 xattn = 5, 两相机共 10
+
+训练:
+  - Score matching loss (扩散去噪损失)
+  - 可选: MoE load balancing loss + router z-loss
+
+推理 (action chunking):
+  每 multistep=10 步调用一次 DDIM 采样 → 预测 10 步 action chunk,
+  中间步复用缓存,减少计算。
+"""
+
 import logging
 import os
 from typing import Any, Dict, Optional, Tuple, List, DefaultDict
@@ -23,7 +48,7 @@ from mode.models.networks.modedit import NoiseBlockMoE
 from mode.utils.lang_buffer import AdvancedLangEmbeddingBuffer
 from mode.models.networks.task_plan_fuser import TaskPlanFuser
 from mode.models.perceptual_encoders.dino_encoder import DinoV2Encoder
-from mode.models.networks.lang_perceiver import LangPerceiver
+from mode.models.networks.lang_perceiver import LangPerceiver, VisualPlanResampler
 
 
 logger = logging.getLogger(__name__)
@@ -43,51 +68,65 @@ def print_model_parameters(model):
     
 class MoDEAgent(pl.LightningModule):
     """
-    The lightning module used for training.
+    MoDE 扩散策略主模型 (LightningModule)。
+
+    核心数据流:
+      1. 图像 → FiLM-ResNet50 → pooled token (+ xattn local tokens)
+      2. 任务指令 + plan → CLIP → TaskPlanFuser → goal embedding
+      3. plan → CLIP → LangPerceiver query → 从 ResNet patch 提取局部 token
+      4. [σ, goal, state, noisy_action] → MoDeDiT (10步DDIM) → 预测 action chunk
+
+    关键开关 (conf/model/mode_agent.yaml):
+      - use_plan_fusion: 是否启用 TaskPlanFuser (实验二+)
+      - use_dino: 是否用 DINOv2 替换 ResNet (实验三, 已弃用)
+      - use_resnet_xattn: 是否叠加 plan 交叉注意力 (实验四)
     """
     def __init__(
         self,
-        language_goal: DictConfig,
-        model: DictConfig,
-        optimizer: DictConfig,
-        lr_scheduler: DictConfig,
-        latent_dim: int = 512,
-        multistep: int = 10,
-        sampler_type: str = 'ddim',
-        num_sampling_steps: int = 10,
-        sigma_data: float = 0.5,
-        sigma_min: float = 0.001,
-        sigma_max: float = 80,
-        noise_scheduler: str = 'exponential',
-        sigma_sample_density_type: str = 'loglogistic',
-        use_perceiver: bool = False,
-        obs_enc_dim: int = 512,
-        cond_dim: int = 512,
-        use_lr_scheduler: bool = True,
-        ckpt_path=None,
+        language_goal: DictConfig,   # 语言编码器配置 (CLIP)
+        model: DictConfig,           # 扩散主干 MoDeDiT 配置
+        optimizer: DictConfig,       # 优化器配置 (AdamW)
+        lr_scheduler: DictConfig,    # 学习率调度器配置 (TriStage)
+        latent_dim: int = 512,       # 潜在空间维度
+        multistep: int = 10,         # action chunk 长度 (每次预测几步动作)
+        sampler_type: str = 'ddim',  # 扩散采样器类型
+        num_sampling_steps: int = 10,  # DDIM 去噪步数
+        sigma_data: float = 0.5,     # 数据标准差 (EDM 超参)
+        sigma_min: float = 0.001,    # 最小噪声级别
+        sigma_max: float = 80,       # 最大噪声级别
+        noise_scheduler: str = 'exponential',  # 噪声调度类型
+        sigma_sample_density_type: str = 'loglogistic',  # 训练时噪声采样分布
+        use_perceiver: bool = False,   # 是否用 Perceiver (旧版,未用)
+        obs_enc_dim: int = 512,        # 观测编码维度
+        cond_dim: int = 512,           # 条件向量维度 (CLIP 输出)
+        use_lr_scheduler: bool = True, # 是否启用学习率调度
+        ckpt_path=None,                # 预训练权重路径
         seed: int = 42,
-        entropy_gamma: float = 0.0,
-        router_z_delta: float = 0.001,
-        start_from_pretrained: bool = False,
-        use_text_not_embedding: bool = True,
-        use_proprio: bool = False,
-        act_window_size: int = 10,
-        resnet_type: str = '18',
-        use_plan_fusion: bool = True,
-        plan_fuser_hidden_dim: int = 512,
-        plan_fuser_dropout: float = 0.1,
-        use_dino: bool = False,
-        dino_model_name: str = 'dinov2_vitb14',
-        num_visual_latents: int = 4,
-        visual_latent_dim: int = 512,
-        perceiver_depth: int = 2,
-        use_resnet_xattn: bool = False,
-        resnet_xattn_latents: int = 4,
-        resnet_xattn_depth: int = 1,
+        entropy_gamma: float = 0.0,    # MoE 负载均衡损失权重
+        router_z_delta: float = 0.001, # Router z-loss 权重
+        start_from_pretrained: bool = False,  # 是否从 OXE 预训练 warm-start
+        use_text_not_embedding: bool = True,  # True=运行时 CLIP 编码文本, False=用离线 embedding
+        use_proprio: bool = False,     # 是否使用本体感觉 (关节角度)
+        act_window_size: int = 10,     # 动作窗口大小 (=multistep)
+        resnet_type: str = '18',       # ResNet 型号: '18'/'34'/'50'
+        use_plan_fusion: bool = True,  # 是否启用 plan 融合 (实验二+)
+        plan_fuser_hidden_dim: int = 512,  # TaskPlanFuser 隐藏层维度
+        plan_fuser_dropout: float = 0.1,   # TaskPlanFuser dropout
+        use_dino: bool = False,        # 是否用 DINOv2 视觉骨干 (实验三, 已弃用)
+        dino_model_name: str = 'dinov2_vitb14',  # DINO 模型名
+        num_visual_latents: int = 4,   # Perceiver 输出 token 数
+        visual_latent_dim: int = 512,  # Perceiver 工作维度
+        perceiver_depth: int = 2,      # Perceiver 层数
+        use_resnet_xattn: bool = False,    # 是否叠加 plan 交叉注意力 (实验四)
+        resnet_xattn_latents: int = 4,     # 每相机 plan-queried local token 数
+        resnet_xattn_depth: int = 1,       # xattn Perceiver 层数
+        xattn_visual_query: bool = False,  # 实验四 v2 (方案三): 视觉当 Q, 分步规划当 KV
+        xattn_query_grid: int = 2,         # v2 视觉自适应池化网格边长 (token 数 = grid^2)
+        xattn_max_plan_steps: int = 16,    # v2 规划步数上限 (位置编码表大小)
     ):
         super(MoDEAgent, self).__init__()
-        # Set obs_dim: DINO+Perceiver outputs `visual_latent_dim` tokens; the
-        # ResNet path keeps the original resnet-type-dependent dim.
+        # ---- 确定视觉 token 维度 ----
+        # DINO 路径: visual_latent_dim(512); ResNet50 路径: 2048; ResNet18/34: 512
         self.use_dino = use_dino
         if use_dino:
             obs_dim = visual_latent_dim
@@ -95,33 +134,33 @@ class MoDEAgent(pl.LightningModule):
             obs_dim = 2048 if resnet_type == '50' else 512
         self.latent_dim = latent_dim
         model.inner_model.obs_dim = obs_dim
+        # ---- 实例化扩散主干 MoDeDiT (DiT + MoE) ----
         self.model = hydra.utils.instantiate(model).to(self.device)
 
         if use_dino:
-            # Frozen DINOv2 backbone shared by both cameras + per-camera
-            # language(plan)-conditioned Perceiver heads.
+            # ---- 实验三路径: 冻结 DINOv2 + 每相机一个 LangPerceiver ----
             self.dino = DinoV2Encoder(model_name=dino_model_name, freeze=True, clip_norm_input=True)
-            self.static_perceiver = LangPerceiver(
+            self.static_perceiver = LangPerceiver(    # 静态相机的 Perceiver
                 media_dim=self.dino.embed_dim, dim=visual_latent_dim,
                 num_latents=num_visual_latents, depth=perceiver_depth, cond_dim=cond_dim,
             )
-            self.gripper_perceiver = LangPerceiver(
+            self.gripper_perceiver = LangPerceiver(   # 手腕相机的 Perceiver
                 media_dim=self.dino.embed_dim, dim=visual_latent_dim,
                 num_latents=num_visual_latents, depth=perceiver_depth, cond_dim=cond_dim,
             )
             self.use_film_resnet = False
         else:
-            # Select ResNet type based on parameter
+            # ---- 主路径: FiLM-ResNet (ImageNet + OXE 预训练) ----
             if resnet_type == '18':
-                ResNetClass = ResNetEncoderWithFiLM  # You'll need to import this
+                ResNetClass = ResNetEncoderWithFiLM
             elif resnet_type == '34':
                 ResNetClass = FiLMResNet34Policy
             elif resnet_type == '50':
                 ResNetClass = FiLMResNet50Policy
             else:
                 raise ValueError(f"Unsupported ResNet type: {resnet_type}")
-            self.static_resnet = ResNetClass(cond_dim)
-            self.gripper_resnet = ResNetClass(cond_dim)
+            self.static_resnet = ResNetClass(cond_dim)   # 静态相机 ResNet
+            self.gripper_resnet = ResNetClass(cond_dim)   # 手腕相机 ResNet
             self.use_film_resnet = True
             # --- 实验四: FiLM-ResNet + plan 交叉注意力 ---
             # 保留 FiLM-ResNet50(OXE warm-start),在其 layer4 patch tokens 之上叠加
@@ -131,15 +170,31 @@ class MoDEAgent(pl.LightningModule):
             if use_resnet_xattn:
                 assert resnet_type == '50', \
                     "use_resnet_xattn 目前假设 ResNet50(2048-d 特征)"
-                self.static_xattn = LangPerceiver(
-                    media_dim=obs_dim, dim=obs_dim,
-                    num_latents=resnet_xattn_latents, depth=resnet_xattn_depth, cond_dim=cond_dim,
-                )
-                self.gripper_xattn = LangPerceiver(
-                    media_dim=obs_dim, dim=obs_dim,
-                    num_latents=resnet_xattn_latents, depth=resnet_xattn_depth, cond_dim=cond_dim,
-                )
+                if xattn_visual_query:
+                    # v2 (方案三): 视觉(2×2 池化)当 Q, 分步规划 token 当 KV。
+                    # 内部工作维度 = cond_dim(512), 输出升回 obs_dim(2048)。
+                    self.static_xattn = VisualPlanResampler(
+                        media_dim=obs_dim, plan_dim=cond_dim, dim=cond_dim,
+                        query_grid=xattn_query_grid, depth=resnet_xattn_depth,
+                        max_plan_steps=xattn_max_plan_steps,
+                    )
+                    self.gripper_xattn = VisualPlanResampler(
+                        media_dim=obs_dim, plan_dim=cond_dim, dim=cond_dim,
+                        query_grid=xattn_query_grid, depth=resnet_xattn_depth,
+                        max_plan_steps=xattn_max_plan_steps,
+                    )
+                else:
+                    # v1: 固定可学 latent 当 Q, 视觉 patch 当 KV (Flamingo 风格)。
+                    self.static_xattn = LangPerceiver(
+                        media_dim=obs_dim, dim=obs_dim,
+                        num_latents=resnet_xattn_latents, depth=resnet_xattn_depth, cond_dim=cond_dim,
+                    )
+                    self.gripper_xattn = LangPerceiver(
+                        media_dim=obs_dim, dim=obs_dim,
+                        num_latents=resnet_xattn_latents, depth=resnet_xattn_depth, cond_dim=cond_dim,
+                    )
         self.use_resnet_xattn = bool(use_resnet_xattn) and not use_dino
+        self.xattn_visual_query = bool(xattn_visual_query)
         self.use_perceiver = use_perceiver
         self.use_text_not_embedding = use_text_not_embedding
         self.act_window_size = act_window_size
@@ -147,8 +202,9 @@ class MoDEAgent(pl.LightningModule):
         self.use_lr_scheduler = use_lr_scheduler
         self.use_proprio = use_proprio
         self.use_plan_fusion = use_plan_fusion
-        # goal encoders
+        # ---- 语言编码器 (CLIP, 冻结) ----
         self.language_goal = hydra.utils.instantiate(language_goal) if language_goal else None
+        # ---- TaskPlanFuser: 融合 task + plan → goal embedding ----
         self.task_plan_fuser = TaskPlanFuser(
             in_dim=cond_dim,
             hidden_dim=plan_fuser_hidden_dim,
@@ -157,15 +213,13 @@ class MoDEAgent(pl.LightningModule):
         )
         self.modality_scope = "lang"
         self.optimizer_config = optimizer
-        # lr multiplier for from-scratch visual modules (DINO Perceivers + tok_emb +
-        # plan fuser). They start random while the transformer is warm-started, so a
-        # higher lr helps them catch up. 1.0 = no boost. See configure_optimizers.
+        # 从零训练模块(Perceiver/Fuser)的学习率倍增,帮它们追上 warm-started 的主干
         self.visual_lr_scale = float(optimizer.get("visual_lr_scale", 1.0)) \
             if hasattr(optimizer, "get") else getattr(optimizer, "visual_lr_scale", 1.0)
         self.lr_scheduler = lr_scheduler
-        self.entropy_gamma = entropy_gamma
-        self.router_z_delta = router_z_delta
-        # diffusion stuff
+        self.entropy_gamma = entropy_gamma       # MoE 负载均衡损失系数
+        self.router_z_delta = router_z_delta     # Router z-loss 系数
+        # ---- 扩散采样相关超参 ----
         self.sampler_type = sampler_type
         self.num_sampling_steps = num_sampling_steps
         self.noise_scheduler = noise_scheduler
@@ -173,27 +227,33 @@ class MoDEAgent(pl.LightningModule):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_sample_density_type = sigma_sample_density_type
-        # for inference
-        self.rollout_step_counter = 0
-        self.multistep = multistep
+        # ---- 推理状态 ----
+        self.rollout_step_counter = 0  # action chunk 内的当前步索引
+        self.multistep = multistep     # chunk 长度 (每10步预测一次)
         self.latent_goal = None
         self.start_from_pretrained = start_from_pretrained
         self.ema_callback_idx = None
         self.save_hyperparameters()
 
-        # finetuning specific attributes
+        # 微调相关属性
         self.expert_analysis_complete = False
         self.finetuning_config = None
         self.frozen_expert_mask = None
 
+        # 如果指定了预训练权重,加载 OXE checkpoint
         if self.start_from_pretrained and ckpt_path is not None:
             self.load_pretrained_parameters(ckpt_path)
 
         self.need_precompute_experts_for_inference = False
 
+        # 语言 embedding 缓存 (避免重复 CLIP forward, 容量 10000)
         self.lang_buffer = AdvancedLangEmbeddingBuffer(self.language_goal, 10000)
 
     def _compute_fused_goal_embedding(self, task_text, plan_text=None):
+        """
+        计算融合后的 goal embedding: task_emb + plan_emb → TaskPlanFuser → fused_goal。
+        如果 plan_text 为 None,则直接返回 task 的 CLIP embedding。
+        """
         task_emb = self.lang_buffer.get_goal_instruction_embeddings(task_text)
         if plan_text is None:
             return task_emb
@@ -202,8 +262,15 @@ class MoDEAgent(pl.LightningModule):
 
     def load_pretrained_parameters(self, ckpt_path, strict: bool = False):
         """
-        Load pretrained parameters specifically for ResNet50 with FiLM layers.
-        Handles ImageNet pretrained weights and potential tensor format differences.
+        加载 OXE 预训练权重到当前模型。
+
+        支持格式: safetensors / PyTorch .pt / Lightning .ckpt
+        处理逻辑:
+          1. 读 state_dict
+          2. 对每个 key 做前缀映射 (OXE 的 key 名 → 当前模型 key 名)
+          3. 形状不匹配的尝试 reshape, 实在不行就跳过
+          4. strict=False 允许部分缺失 (新增模块如 xattn/fuser 没有预训练权重)
+          5. 加载后冻结 router (prepare_model_for_finetuning)
         """
         print(f"Loading parameters from {ckpt_path}")
         
@@ -335,7 +402,15 @@ class MoDEAgent(pl.LightningModule):
 
     def configure_optimizers(self):
         """
-        Initialize optimizers and learning rate schedulers based on model configuration.
+        配置优化器和学习率调度器。
+
+        参数分组策略:
+          - DiT 主干: 正常 lr + weight decay
+          - bias/LayerNorm: 不加 weight decay
+          - 从零训练模块 (Perceiver/Fuser/tok_emb): lr × visual_lr_scale (加速追赶)
+          - ResNet: 正常 lr (已有 OXE 预训练)
+
+        学习率调度: TriStage (warmup → constant → decay)
         """
         # Configuration for models using transformer weight decay
         '''optim_groups = self.action_decoder.model.inner_model.get_optim_groups(
@@ -396,7 +471,8 @@ class MoDEAgent(pl.LightningModule):
 
     def on_before_zero_grad(self, optimizer=None):
         """
-        Extended gradient monitoring and logging for wrapped model with inner model, blocks, and layers
+        梯度监控: 在每步 zero_grad 前记录各层梯度范数,用于 wandb 调试。
+        记录内容: total_grad_norm, 每个 block 每层的 grad_norm。
         """
         total_grad_norm = 0.0
         layer_grad_norms = {'input_layers': 0.0, 'blocks': {}}
@@ -456,7 +532,10 @@ class MoDEAgent(pl.LightningModule):
         #    self.log(f"debug/grad_{stat}", np.mean(values), on_step=True, on_epoch=False, sync_dist=True)
 
     def get_optim_groups(self):
-        # Helper function to check if a parameter should use weight decay
+        """
+        将 DiT 主干参数分为三组: 有 weight_decay / 无 weight_decay / 需要 lr boost。
+        bias、LayerNorm 不加 decay; DINO 路径下 tok_emb 是从零训练的要 boost lr。
+        """
         def use_weight_decay(name):
             return all(x not in name for x in ['bias', 'LayerNorm', 'embedding'])
 
@@ -492,16 +571,13 @@ class MoDEAgent(pl.LightningModule):
 
     def training_step(self, batch: Dict[str, Dict], batch_idx: int) -> torch.Tensor:
         """
-        Compute and return the training loss for the mode Agent.
-        The training loss consists of the score matching loss of the diffusion model 
-        and the contrastive loss of the CLIP model for the multimodal encoder.
-        
-        Args:
-            batch: Dictionary containing the batch data for each modality.
-            batch_idx: Index of the batch.
-            
-        Returns:
-            loss tensor
+        训练步: 计算总损失 = 扩散去噪损失 + (可选) MoE负载均衡损失 + router z-loss。
+
+        流程:
+          1. compute_input_embeddings → 视觉 token + goal embedding
+          2. diffusion_loss → score matching 损失 (核心 BC 损失)
+          3. 可选附加 MoE 正则损失
+          4. 记录 metrics 到 wandb
         """
         total_loss = torch.tensor(0.0, device=self.device)
         action_loss = torch.tensor(0.0, device=self.device)
@@ -547,7 +623,11 @@ class MoDEAgent(pl.LightningModule):
         return total_loss
 
     @torch.no_grad()
-    def validation_step(self, batch: Dict[str, Dict], batch_idx: int) -> None:  # Change return type to None
+    def validation_step(self, batch: Dict[str, Dict], batch_idx: int) -> None:
+        """
+        验证步: 用 DDIM 采样预测 action → 与 GT action 计算 MSE → 记录 val_act_loss。
+        同时统计各层专家使用率 (热力图)。
+        """
         output = {}
         dataset_batch = batch
         perceptual_emb, latent_goal = self.compute_input_embeddings(dataset_batch)
@@ -571,6 +651,10 @@ class MoDEAgent(pl.LightningModule):
         return output
     
     def log_expert_usage(self, model, epoch):
+        """
+        统计并可视化 MoE 各层各专家的使用率热力图,上传到 wandb。
+        用于监控路由是否均匀(防止专家坍缩)。
+        """
         log_dir = self.logger.save_dir
         expert_usages = {}
 
@@ -631,7 +715,14 @@ class MoDEAgent(pl.LightningModule):
       
     def compute_input_embeddings(self, dataset_batch):
         """
-        Compute the required embeddings for the visual ones and the latent goal.
+        计算模型输入的两大 embedding:
+          1. perceptual_emb: 视觉 state tokens (来自 ResNet/DINO + 可选 xattn)
+          2. latent_goal: goal embedding (task 指令 ± plan 融合)
+
+        处理逻辑:
+          - use_dino=True → DINO patch + Perceiver(plan条件)
+          - use_resnet_xattn=True → FiLM-ResNet + plan交叉注意力
+          - 其他 → 纯 FiLM-ResNet pooled token
         """
         # 1. extract the revelant visual observations
         latent_goal = None
@@ -658,22 +749,41 @@ class MoDEAgent(pl.LightningModule):
             else:
                 latent_goal = self.language_goal(dataset_batch["lang"]).to(rgb_static.dtype)
 
-            # FiLM-ResNet + xattn: goal 走 FiLM(task 或 fused),plan 单独当 xattn query。
+            # FiLM-ResNet + xattn: goal 走 FiLM(task 或 fused),plan 单独走 xattn。
+            # v1 用池化 plan 向量(vis_cond);v2(方案三)用原始 plan 字符串分步编码。
             vis_cond = None
-            if getattr(self, "use_resnet_xattn", False) and plan_text is not None:
+            if getattr(self, "use_resnet_xattn", False) and plan_text is not None \
+                    and not getattr(self, "xattn_visual_query", False):
                 vis_cond = self.lang_buffer.get_goal_instruction_embeddings(plan_text).to(rgb_static.dtype)
-            perceptual_emb = self.embed_visual_obs(rgb_static, rgb_gripper, latent_goal, vis_cond)
+            perceptual_emb = self.embed_visual_obs(
+                rgb_static, rgb_gripper, latent_goal, vis_cond, plan_text=plan_text)
 
         if self.use_proprio:
             perceptual_emb['robot_obs'] = dataset_batch['robot_obs']
         
         return perceptual_emb, latent_goal
     
-    def embed_visual_obs(self, rgb_static, rgb_gripper, cond, vis_cond=None):
-        # `cond` is the conditioning vector: the FiLM goal for the ResNet path,
-        # or the plan embedding (perceiver query bias) for the DINO path.
-        # `vis_cond` is the plan embedding used as the cross-attention query in
-        # the FiLM-ResNet + xattn path (DINO path ignores it: it queries with cond).
+    def embed_visual_obs(self, rgb_static, rgb_gripper, cond, vis_cond=None, plan_text=None):
+        """
+        编码视觉观测为 token 序列。
+
+        三条路径:
+          1. use_dino: DINO patch → LangPerceiver(plan条件) → k token/相机
+          2. use_resnet_xattn: FiLM-ResNet → pooled + xattn(plan) → (1+k) token/相机
+             - v1: 固定 latent 当 Q, 视觉当 KV (用 vis_cond, plan 池化向量)
+             - v2 (方案三): 视觉当 Q, 分步规划当 KV (用 plan_text, 分步 token)
+          3. 默认: FiLM-ResNet → pooled → 1 token/相机
+
+        Args:
+            rgb_static: 静态相机图像 [B, T, C, H, W]
+            rgb_gripper: 手腕相机图像 [B, T, C, H, W]
+            cond: FiLM 条件向量(goal_emb) 或 DINO 路径的 plan_emb
+            vis_cond: plan 池化向量,仅 v1 xattn 路径使用(作为交叉注意力 query)
+            plan_text: 原始 plan 字符串列表,仅 v2 xattn 路径使用(分步编码当 KV)
+
+        Returns:
+            {'state_images': [B, N_tokens, dim]} 视觉 token 序列
+        """
         b = rgb_static.shape[0]
         # reshape rgb_static and rgb_gripper
         rgb_static = einops.rearrange(rgb_static, 'b t c h w -> (b t) c h w')
@@ -698,22 +808,39 @@ class MoDEAgent(pl.LightningModule):
             return {'state_images': token_seq}
 
         if self.use_film_resnet and getattr(self, "use_resnet_xattn", False):
-            # FiLM-ResNet (OXE warm-start, language via FiLM) + plan-queried
-            # cross-attention over layer4 patch tokens. Per camera the policy gets
-            # 1 pooled (global) token + k plan-selected (local) tokens, all 2048-d
-            # so they share the warm-started tok_emb.
-            q = vis_cond if vis_cond is not None else cond
-            if q.dim() == 3:
-                q = q.squeeze(1)
+            # FiLM-ResNet (OXE warm-start, language via FiLM) + plan 交叉注意力。
+            # 每相机 = 1 pooled(全局)token + k 个 plan-aware 局部 token, 均 2048-d,
+            # 复用 warm-started tok_emb。
             bt = rgb_static.shape[0]
-            if q.shape[0] != bt:  # repeat plan across the obs time steps
-                q = q.repeat_interleave(bt // q.shape[0], dim=0)
-            q = q.to(self.static_xattn.lang_proj.weight.dtype)
-
             s_pooled, s_patches = self.static_resnet(rgb_static, cond, return_patches=True)
             g_pooled, g_patches = self.gripper_resnet(rgb_gripper, cond, return_patches=True)
-            s_tok = torch.cat([s_pooled.unsqueeze(1), self.static_xattn(s_patches, q)], dim=1)
-            g_tok = torch.cat([g_pooled.unsqueeze(1), self.gripper_xattn(g_patches, q)], dim=1)
+
+            if getattr(self, "xattn_visual_query", False):
+                # v2 (方案三): 视觉(2×2 池化)当 Q, 分步规划 token 当 KV。
+                assert plan_text is not None, \
+                    "xattn_visual_query=True 需要 plan_text(分步规划字符串), 但收到 None"
+                plan_tokens, plan_mask = self.lang_buffer.get_plan_step_embeddings(plan_text)
+                plan_tokens = plan_tokens.to(device=s_patches.device, dtype=s_patches.dtype)
+                plan_mask = plan_mask.to(device=s_patches.device, dtype=s_patches.dtype)
+                if plan_tokens.shape[0] != bt:  # plan 沿 obs 时间步展开
+                    rep = bt // plan_tokens.shape[0]
+                    plan_tokens = plan_tokens.repeat_interleave(rep, dim=0)
+                    plan_mask = plan_mask.repeat_interleave(rep, dim=0)
+                s_local = self.static_xattn(s_patches, plan_tokens, plan_mask)
+                g_local = self.gripper_xattn(g_patches, plan_tokens, plan_mask)
+            else:
+                # v1: 固定 latent 当 Q, 视觉 patch 当 KV (Flamingo 风格)。
+                q = vis_cond if vis_cond is not None else cond
+                if q.dim() == 3:
+                    q = q.squeeze(1)
+                if q.shape[0] != bt:  # plan 沿 obs 时间步展开
+                    q = q.repeat_interleave(bt // q.shape[0], dim=0)
+                q = q.to(self.static_xattn.lang_proj.weight.dtype)
+                s_local = self.static_xattn(s_patches, q)
+                g_local = self.gripper_xattn(g_patches, q)
+
+            s_tok = torch.cat([s_pooled.unsqueeze(1), s_local], dim=1)
+            g_tok = torch.cat([g_pooled.unsqueeze(1), g_local], dim=1)
             s_tok = einops.rearrange(s_tok, '(b t) n d -> b (t n) d', b=b)
             g_tok = einops.rearrange(g_tok, '(b t) n d -> b (t n) d', b=b)
             return {'state_images': torch.cat([s_tok, g_tok], dim=1)}
@@ -735,23 +862,26 @@ class MoDEAgent(pl.LightningModule):
         return perceptual_emb
  
     def _log_training_metrics(self, action_loss, total_loss, total_bs):
-        """
-        Log the training metrics.
-        """
+        """记录训练指标到 wandb: action_loss 和 total_loss。"""
         self.log("train/action_loss", action_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=total_bs)
         self.log("train/total_loss", total_loss, on_step=False, on_epoch=True, sync_dist=True,batch_size=total_bs)
         
     
     def reset(self):
-        """
-        Call this at the beginning of a new rollout when doing inference.
-        """
+        """推理时每条新 rollout 开头调用: 清空缓存的 goal 和 action chunk 计数器。"""
         self.latent_goal = None
         self.rollout_step_counter = 0
     
     def forward(self, obs, goal):
         """
-        Method for doing inference with the model.
+        推理入口: 给定当前观测和目标,经 DDIM 采样输出完整 action chunk。
+
+        Args:
+            obs: {'rgb_obs': {'rgb_static': [1,T,C,H,W], 'rgb_gripper': ...}}
+            goal: {'lang_text': str, 'plan_text': str (可选), 'lang': tensor (可选)}
+
+        Returns:
+            action_seq: [1, multistep, 7] 预测的动作序列
         """
         vis_cond = None
         if self.use_dino:
@@ -776,14 +906,20 @@ class MoDEAgent(pl.LightningModule):
         rgb_static = obs["rgb_obs"]['rgb_static']
         rgb_gripper = obs["rgb_obs"]['rgb_gripper']
 
-        # FiLM-ResNet + xattn inference: plan 当 xattn query。
+        # FiLM-ResNet + xattn inference: plan 走 xattn。
+        # v1 用池化 plan 向量;v2(方案三)用原始 plan 字符串分步编码。
+        plan_text = None
         if getattr(self, "use_resnet_xattn", False) and not self.use_dino and "plan_text" in goal:
-            vis_cond = self.lang_buffer.get_goal_instruction_embeddings(goal["plan_text"]).to(torch.float32)
+            if getattr(self, "xattn_visual_query", False):
+                plan_text = [goal["plan_text"]]
+            else:
+                vis_cond = self.lang_buffer.get_goal_instruction_embeddings(goal["plan_text"]).to(torch.float32)
 
         perceptual_emb = self.embed_visual_obs(
             rgb_static, rgb_gripper,
             vis_cond if self.use_dino else latent_goal,
             vis_cond=None if self.use_dino else vis_cond,
+            plan_text=plan_text,
         )
         
         act_seq = self.denoise_actions(
@@ -796,16 +932,17 @@ class MoDEAgent(pl.LightningModule):
 
     def step(self, obs, goal):
         """
-        Do one step of inference with the model. THis method handles the action chunking case.
-        Our model is trained to predict a sequence of actions. 
-        We only compute the sequence once every self.multistep steps to save computation and increase efficiency.
+        单步推理 (带 action chunking)。
+
+        模型每 multistep(10) 步才运行一次 DDIM 采样(耗时),
+        中间步从缓存的 action chunk 中按序取出动作,节省计算。
 
         Args:
-            obs (dict): Observation from environment.
-            goal (dict): Goal as visual observation or embedded language instruction.
+            obs: 当前环境观测
+            goal: 目标(语言/plan)
 
         Returns:
-            Predicted action.
+            current_action: 当前步应执行的动作 [1, 1, 7]
         """
         if self.rollout_step_counter % self.multistep == 0:
             pred_action_seq = self(obs, goal)
@@ -822,6 +959,10 @@ class MoDEAgent(pl.LightningModule):
         return current_action
     
     def precompute_expert_for_inference(self, goal=None):
+        """
+        推理加速: 对所有噪声级别 σ 预计算路由 → 融合 top-2 专家权重。
+        之后每步去噪直接查缓存,不再跑 router,速度翻倍。
+        """
         logger.info("Precomputing experts with sampling steps %d", self.num_sampling_steps)
         sigmas = self.get_noise_schedule(self.num_sampling_steps, self.noise_scheduler)[:-1]
         # iterate over the sigmas and precompute the experts
@@ -855,7 +996,9 @@ class MoDEAgent(pl.LightningModule):
         actions: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Computes the score matching loss given the perceptual embedding, latent goal, and desired actions.
+        计算扩散去噪的 score matching 损失 (训练核心)。
+
+        流程: 采样噪声级别 σ → 给 actions 加噪 → 模型预测去噪方向 → MSE loss
         """
         self.model.train()
         sigmas = self.make_sample_density()(shape=(len(actions),), device=self.device).to(self.device)
@@ -882,9 +1025,10 @@ class MoDEAgent(pl.LightningModule):
         # self.need_precompute_experts_for_inference = True
 
     def make_sample_density(self):
-        """ 
-        Generate a sample density function based on the desired type for training the model
-        We mostly use log-logistic as it has no additional hyperparameters to tune.
+        """
+        生成训练时的噪声采样分布函数。
+        默认 log-logistic: 低噪声和高噪声都有合理概率被采到,无额外超参需调。
+        返回一个 callable(shape, device) → σ tensor。
         """
         sd_config = []
         if self.sigma_sample_density_type == 'lognormal':
@@ -931,7 +1075,10 @@ class MoDEAgent(pl.LightningModule):
         extra_args={}
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Denoise the next sequence of actions 
+        DDIM 采样: 从随机噪声 x_T 逐步去噪,生成 action chunk。
+
+        流程: x ~ N(0, σ_max²) → 沿 noise schedule 逐步去噪 → x_0 = predicted actions
+        采样步数: num_sampling_steps (默认 10)
         """
         if inference:
             sampling_steps = self.num_sampling_steps
@@ -952,12 +1099,11 @@ class MoDEAgent(pl.LightningModule):
         return actions
     
     def prepare_model_for_finetuning(self):
-        """Prepare model for efficient finetuning"""
-        # Freeze router and unused experts
+        """微调准备: 冻结 MoE router (保持 OXE 预训练学到的噪声路由策略不变)。"""
         self.model.inner_model.freeze_router()
-        # pass
 
     def reset_expert_cache(self):
+        """清空推理时缓存的融合专家权重 (换新 rollout 时调用)。"""
         self.model.inner_model.reset_all_caches() if hasattr(self.model.inner_model, 'reset_all_caches') else None
 
     def sample_loop(

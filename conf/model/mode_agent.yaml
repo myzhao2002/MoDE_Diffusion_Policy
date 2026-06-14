@@ -45,6 +45,17 @@ use_resnet_xattn: False
 resnet_xattn_latents: 4     # plan-queried tokens per camera (besides the pooled token)
 resnet_xattn_depth: 1       # perceiver depth (kept shallow: from-scratch on limited LIBERO data)
 
+# --- 实验四 v2 (方案三): 视觉查询分步规划 (use_resnet_xattn=True 时生效) ---
+# 把 v1 的"固定可学 latent 当 Q、整条 plan 池化向量染色"改成:
+#   视觉(layer4 patch 自适应池化到 grid×grid)当 Q,分步规划 token(每步一个 CLIP
+#   向量 + 可学位置编码)当 K,V,纯交叉注意力 + SwiGLU FFN。让模型靠注意力自己对齐
+#   "当前画面 ≈ 规划第几步"。query 数 = xattn_query_grid^2(默认 4),与 v1 的
+#   resnet_xattn_latents=4 一致 → DiT token 预算不变、warm-start 接口不动。
+# Set xattn_visual_query=True 开启 v2;保持 False 则沿用 v1(可复现 90.0 结果)。
+xattn_visual_query: False
+xattn_query_grid: 2         # 视觉自适应池化网格边长;每相机局部 token 数 = grid^2
+xattn_max_plan_steps: 16    # 规划步数上限(位置编码表大小)
+
 optimizer:
   _target_: torch.optim.AdamW
   transformer_weight_decay: 0.05
