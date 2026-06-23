@@ -166,6 +166,9 @@ def main():
     ap.add_argument("--trace", action="store_true", help="每15步打印目标物体/机械臂/距离, 诊断暂停为何抓不到")
     ap.add_argument("--smart_stall", action="store_true",
                     help="进度感知卡死检测: 机械臂正朝未放好物体靠近(在自愈)就不判卡死, 避免打断自愈策略")
+    ap.add_argument("--dump_tag", default="", help="非空则把恢复后小脑即将看到的obs图(agentview+腕部)存为png对比")
+    ap.add_argument("--freeze_arm", action="store_true",
+                    help="暂停期间把机械臂关节强行锁死(完全不动), 只让物体随物理下落; 验证'手臂不动则暂停无害'")
     args = ap.parse_args()
 
     model, ev = load_models(args.train_folder, args.checkpoint, args.device)
@@ -287,8 +290,24 @@ def main():
                 ee_before = np.array(obs.get("robot0_eef_pos", [0, 0, 0])).copy()
                 obj_before = objpos.get(fobj, np.zeros(3)).copy()
                 s0 = len(frames); hold_act = np.array([0., 0., 0., 0., 0., 0., float(action[6])])
+                # --freeze_arm: 暂停期间把机械臂关节强行锁死(完全不动), 只让物体随物理下落
+                rob_q, rob_v, saved_q = [], [], None
+                if args.freeze_arm:
+                    for j in range(env.sim.model.njnt):
+                        nm = env.sim.model.joint_id2name(j)
+                        if nm and ("robot0" in nm or "gripper" in nm):
+                            rob_q.append(env.sim.model.jnt_qposadr[j]); rob_v.append(env.sim.model.jnt_dofadr[j])
+                    saved_q = env.sim.data.qpos[rob_q].copy()
                 for _ in range(hold):
                     obs, _, done, _ = env.step(hold_act)
+                    if args.freeze_arm:   # 每步把机械臂关节复位回暂停前, 速度清零 -> 真冻结
+                        env.sim.data.qpos[rob_q] = saved_q
+                        env.sim.data.qvel[rob_v] = 0.0
+                        env.sim.forward()
+                        try:
+                            obs = env._get_observations(force_update=True)
+                        except Exception:
+                            pass
                     frames.append(obs["agentview_image"][::-1].copy())
                     if done:
                         break
@@ -303,6 +322,14 @@ def main():
                 # 新计划给小脑 + reset(清空旧动作块缓冲和观测历史) -> 下一步用新计划重新扩散推理
                 cur_plan = cur_plan_new; model.reset(); n_recover += 1
                 events.append((len(frames) - 1, "RECOVER", rec_tag))
+                if args.dump_tag:   # 把小脑恢复后即将看到的 obs(两路相机图+夹爪)dump 出来对比
+                    gq = np.array(obs.get("robot0_gripper_qpos", [0, 0]))
+                    av = obs["agentview_image"][::-1]; wr = obs["robot0_eye_in_hand_image"][::-1]
+                    both = np.concatenate([av, wr], axis=1)
+                    fn = f"/root/autodl-tmp/recovery_obs_{args.dump_tag}_{n_recover}.png"
+                    cv2.imwrite(fn, cv2.cvtColor(both, cv2.COLOR_RGB2BGR))
+                    print(f"[DUMP] {fn}  夹爪qpos={gq}  目标{fobj}位置={objpos.get(fobj)}  新计划={cur_plan[:60]}",
+                          flush=True)
         if done:
             print(f"[closed] task done at t={t}")
             break
