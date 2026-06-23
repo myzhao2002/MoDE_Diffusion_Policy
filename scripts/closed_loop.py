@@ -33,7 +33,7 @@ from scripts.qwen_brain import QwenBrain
 
 class OnlineMonitor:
     """逐步在线判: 物体被握住/放置/掉落 + 卡住。失败当场返回事件。"""
-    def __init__(self, objs, rest_z, targets, near=0.06, lift=0.02, stall_k=110):
+    def __init__(self, objs, rest_z, targets, near=0.06, lift=0.02, stall_k=110, smart_stall=False):
         self.objs = objs
         self.rest_z = rest_z          # o -> 静止高度
         self.targets = targets        # o -> 目标物体名(basket)
@@ -42,6 +42,10 @@ class OnlineMonitor:
         self.last_event_t = 0
         self.stalled = False          # 锁存: STALL 只报一次, 等真事件再解锁
         self.near, self.lift, self.stall_k = near, lift, stall_k
+        # 进度感知: 机械臂朝未放好物体靠近(说明在自愈)就别误判卡死
+        self.smart_stall = smart_stall
+        self.best_dist = float("inf")  # 自上次事件以来, 机械臂到未放好物体的最小距离
+        self.prog_eps = 0.03           # 距离再缩小 >3cm 算"有进展", 重置卡死计时
 
     def update(self, t, ee, objpos):
         evs = []
@@ -61,7 +65,16 @@ class OnlineMonitor:
             self.held[o] = held_now
         if real:
             self.stalled = False
-        elif not self.stalled and (t - self.last_event_t > self.stall_k):
+            self.best_dist = float("inf")   # 新事件 -> 重新计进度
+        # 进度感知: 机械臂正接近某个未放好物体(距离创新低) = 在自愈, 算活动, 别判卡死
+        if self.smart_stall and not real:
+            unplaced = [o for o in self.objs if not self.placed[o] and o in objpos]
+            if unplaced:
+                dmin = min(np.linalg.norm(ee[:2] - objpos[o][:2]) for o in unplaced)
+                if dmin < self.best_dist - self.prog_eps:
+                    self.best_dist = dmin
+                    self.last_event_t = t        # 有靠近进展 -> 重置卡死计时
+        if not real and not self.stalled and (t - self.last_event_t > self.stall_k):
             evs.append(("STALL", None)); self.stalled = True
         return evs
 
@@ -151,6 +164,8 @@ def main():
     ap.add_argument("--brain_delay_s", type=float, default=0.0,
                     help="人为设定的大脑时延(秒): 恢复时机械臂空等这么久(用于扫时延曲线, 与真大脑解耦)")
     ap.add_argument("--trace", action="store_true", help="每15步打印目标物体/机械臂/距离, 诊断暂停为何抓不到")
+    ap.add_argument("--smart_stall", action="store_true",
+                    help="进度感知卡死检测: 机械臂正朝未放好物体靠近(在自愈)就不判卡死, 避免打断自愈策略")
     args = ap.parse_args()
 
     model, ev = load_models(args.train_folder, args.checkpoint, args.device)
@@ -185,7 +200,7 @@ def main():
         obs, _, _, _ = env.step(np.zeros(7))
 
     rest_z = {o: float(env.sim.data.body_xpos[bid[o]][2]) for o in bid}
-    mon = OnlineMonitor(grasp_objs, rest_z, targets)
+    mon = OnlineMonitor(grasp_objs, rest_z, targets, smart_stall=args.smart_stall)
     print(f"[closed] task={task_i.language}")
     print(f"[closed] grasp objects={grasp_objs}, targets={targets}")
     print(f"[closed] inject={args.inject}@{args.inject_step}(+{args.inject_len})")
