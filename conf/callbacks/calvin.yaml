@@ -14,10 +14,19 @@ ema:
 
 checkpoint:
   _target_: pytorch_lightning.callbacks.ModelCheckpoint
-  save_top_k: 1
-  verbose: True
+  # 按长程 rollout 成功度(avg_seq_len)选最优, 不用 val_loss
+  # ——val_loss 最优点常已过 rollout 峰值(LIBERO 那边的坑)。
   monitor: eval_lh/avg_seq_len
   mode: max
+  # save_top_k=5: 多保留, 防止 rollout 峰值 ckpt 被后续单次回落顶掉删除
+  # (旧 save_top_k=1 在 LIBERO 上删过 v2 峰值)。
+  save_top_k: 5
+  # 额外存 last.ckpt, 便于断点续训。
+  save_last: True
+  # 必须 false: EMA shadow 权重通过 callback state 持久化, weights_only 会丢掉它。
+  save_weights_only: false
+  verbose: True
+  # 相对路径 = 每个 hydra run 各自的 saved_models, baseline/xattn 两次 run 不互相覆盖。
   dirpath: saved_models
   filename: '{epoch:02d}_{eval_lh/avg_seq_len:.2f}'
   every_n_epochs: ${callbacks.rollout_lh.rollout_freq}
