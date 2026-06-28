@@ -28,10 +28,17 @@ for i in $(seq "$START" "$END"); do
   fi
 
   echo "=== [$n] downloading $fn ==="
-  # xet 大文件: 一次一个文件(本循环本就串行), -x16 -s16, -c 续传
-  aria2c -x 16 -s 16 -c --file-allocation=none --summary-interval=20 \
-         -d "$ZIPDIR" -o "$fn" "$url"
-  if [ $? -ne 0 ]; then echo "[dl][ERR] $n download failed, 重跑本脚本可续传"; exit 1; fi
+  # xet 大文件: 串行下载, -x16 -s16, -c 续传。--max-tries/--retry-wait 让 aria2 在
+  # xet 签名URL过期(403)时重新解析 hf-mirror URL 拿新签名; 再叠加脚本级 3 次重试兜底。
+  ok=0
+  for attempt in 1 2 3; do
+    aria2c -x 16 -s 16 -c --max-tries=10 --retry-wait=15 \
+           --timeout=60 --connect-timeout=30 --max-file-not-found=5 \
+           --file-allocation=none --summary-interval=20 \
+           -d "$ZIPDIR" -o "$fn" "$url" && { ok=1; break; }
+    echo "[dl][WARN] $n 第 $attempt/3 次失败, 15s 后重试(aria2 -c 续传)"; sleep 15
+  done
+  if [ "$ok" -ne 1 ]; then echo "[dl][ERR] $n 三次仍失败, 终止(重跑本脚本可续传)"; exit 1; fi
 
   echo "=== [$n] unzip -> $outdir ==="
   mkdir -p "$outdir"
