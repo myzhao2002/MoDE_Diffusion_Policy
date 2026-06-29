@@ -1,18 +1,17 @@
 #!/bin/bash
 # =============================================================================
-# CALVIN 实验四 A/B: baseline(无xattn) vs v2(视觉Q / 分步plan当KV) + 训完自动关机
+# CALVIN 实验四 三臂消融: baseline(原版MoDE) / v1(加plan) / v2(plan+视觉Q-planKV) + 训完自动关机
 #
 # 用法(GPU 模式下):
 #   nohup bash scripts/run_calvin_xattn_ab.sh > /root/autodl-tmp/calvin_ab.log 2>&1 &
 #   tail -f /root/autodl-tmp/calvin_ab.log
 #
 #   SHUTDOWN_MODE=never bash scripts/run_calvin_xattn_ab.sh   # 不关机(调试)
-#   ARM=xattn   bash scripts/run_calvin_xattn_ab.sh           # 只跑 v2 臂
-#   ARM=baseline bash scripts/run_calvin_xattn_ab.sh          # 只跑 baseline 臂
+#   ARM=v2  bash scripts/run_calvin_xattn_ab.sh               # 只跑某臂: baseline | v1 | v2
 #   ROOT=/path BATCH_SIZE=48 MAX_EPOCHS=30 bash ...           # 覆盖默认
 #
 # 前置: 数据已 merge 到 $ROOT/{training,validation};calvin_env 已装好(rollout 需要)。
-# 关机守卫: on-success = 两臂都成功才关机;任一失败保留实例调试。
+# 关机守卫: on-success = 三臂全成功才关机;任一失败保留实例调试。
 # =============================================================================
 set -u
 
@@ -23,7 +22,7 @@ PRETRAINED="${PRETRAINED:-/root/autodl-tmp/MoDE_Pretrained}"
 SHUTDOWN_MODE="${SHUTDOWN_MODE:-on-success}"   # always | on-success | never
 BATCH_SIZE="${BATCH_SIZE:-32}"
 MAX_EPOCHS="${MAX_EPOCHS:-20}"
-ARM="${ARM:-both}"                              # both | baseline | xattn
+ARM="${ARM:-all}"                               # all | baseline | v1 | v2
 CKPT_BASE="${CKPT_BASE:-/root/autodl-tmp/MoDE_ckpts_calvin}"
 
 # ---- env ----
@@ -73,13 +72,19 @@ run_arm () {
 }
 
 CODE=0
-if [ "$ARM" = "both" ] || [ "$ARM" = "baseline" ]; then
-  # baseline: 无 plan 交叉注意力(plan 仍经 fusion 进 goal); 与 v2 唯一差别 = 视觉xattn
-  run_arm baseline model.use_resnet_xattn=False || CODE=$?
+# 三臂消融阶梯:
+#   baseline = 原版 MoDE, 不加 plan      (use_plan_fusion=False, 无 xattn)
+#   v1       = 加 plan(融进 goal)       (use_plan_fusion=True,  无 xattn)
+#   v2       = plan + 视觉Q/分步plan-KV   (use_plan_fusion=True,  use_resnet_xattn=True, xattn_visual_query=True)
+# baseline->v1 看"plan 有没有用"; v1->v2 看"新视觉交叉注意力在 plan 之上有没有用"。
+if [ "$ARM" = "all" ] || [ "$ARM" = "baseline" ]; then
+  run_arm baseline model.use_plan_fusion=False model.use_resnet_xattn=False || CODE=$?
 fi
-if [ "$ARM" = "both" ] || [ "$ARM" = "xattn" ]; then
-  # v2: 视觉自适应池化当 Q, 分步 plan token 当 K/V (你的新交叉注意力)
-  run_arm xattn_v2 model.use_resnet_xattn=True model.xattn_visual_query=True || CODE=$?
+if [ "$ARM" = "all" ] || [ "$ARM" = "v1" ]; then
+  run_arm v1_plan  model.use_plan_fusion=True  model.use_resnet_xattn=False || CODE=$?
+fi
+if [ "$ARM" = "all" ] || [ "$ARM" = "v2" ]; then
+  run_arm v2_xattn model.use_plan_fusion=True  model.use_resnet_xattn=True model.xattn_visual_query=True || CODE=$?
 fi
 
 echo "==================== ALL DONE code=$CODE $(date) ===================="
