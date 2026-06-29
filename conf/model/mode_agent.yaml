@@ -21,6 +21,11 @@ obs_enc_dim: ${obs_dim}
 cond_dim: 512
 resnet_type: '50'
 
+# --- 实验二: Task-Plan Fusion (把 LLM 原子 plan 融进 goal embedding) ---
+# True = plan 经 TaskPlanFuser 融进 goal; False = 纯 task 指令(原版 MoDE baseline)。
+# 暴露到 config 以便 CLI 覆盖(三臂消融的 baseline 需 model.use_plan_fusion=False)。
+use_plan_fusion: True
+
 # --- DINOv2 + language(plan) cross-attention visual frontend ---
 # When use_dino=True the FiLM-ResNet is replaced by a frozen DINOv2 backbone
 # whose patch tokens are cross-attended by the whole-plan embedding (LangPerceiver).
@@ -55,6 +60,14 @@ resnet_xattn_depth: 1       # perceiver depth (kept shallow: from-scratch on lim
 xattn_visual_query: False
 xattn_query_grid: 2         # 视觉自适应池化网格边长;每相机局部 token 数 = grid^2
 xattn_max_plan_steps: 16    # 规划步数上限(位置编码表大小)
+
+# --- Run 2: 进度头 + 注意力对齐 + QK-norm (默认全关 = 向后兼容, 复现旧结果) ---
+# use_progress_head 需配合 xattn_visual_query=True 和 datamodule.progress_label_file。
+use_progress_head: False
+progress_lambda: 0.5         # 进度损失 (Huber+CE) 系数 (warmup 后满值)
+attn_align_lambda: 0.2       # 注意力对齐损失系数 (改 backbone 注意力, 给小)
+progress_warmup_epochs: 3    # λ 从 0 线性升到满值的 epoch 数
+xattn_qk_norm: False         # xattn 是否用 QK-norm 掐 attention sink
 
 optimizer:
   _target_: torch.optim.AdamW
