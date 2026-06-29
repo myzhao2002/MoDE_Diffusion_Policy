@@ -30,7 +30,7 @@ source /root/miniconda3/etc/profile.d/conda.sh 2>/dev/null || true
 conda activate lerobot 2>/dev/null || true
 source /etc/network_turbo 2>/dev/null || true
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_MODE="${WANDB_MODE:-online}"   # 在线看曲线; 需 wandb 已登录(~/.netrc)。离线: WANDB_MODE=offline
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export MUJOCO_GL=egl
@@ -56,7 +56,7 @@ COMMON="root_data_dir=$ROOT lang_folder=lang_filtered plan_file=$PLAN \
  model.start_from_pretrained=True model.ckpt_path=$PRETRAINED \
  callbacks.rollout_lh.skip_epochs=19 callbacks.rollout_lh.rollout_freq=1 callbacks.rollout_lh.num_sequences=200 \
  devices=1 batch_size=$BATCH_SIZE trainer.strategy=auto trainer.sync_batchnorm=False \
- max_epochs=$MAX_EPOCHS logger.entity=null"
+ max_epochs=$MAX_EPOCHS logger.entity=null logger.project=calvin_xattn_ablation"
 
 run_arm () {
   local name="$1"; shift
