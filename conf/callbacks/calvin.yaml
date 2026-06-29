@@ -18,9 +18,10 @@ checkpoint:
   # ——val_loss 最优点常已过 rollout 峰值(LIBERO 那边的坑)。
   monitor: eval_lh/avg_seq_len
   mode: max
-  # save_top_k=5: 多保留, 防止 rollout 峰值 ckpt 被后续单次回落顶掉删除
-  # (旧 save_top_k=1 在 LIBERO 上删过 v2 峰值)。
-  save_top_k: 5
+  # save_top_k=1: 只留 rollout 最优。本设定 skip_epochs=19 => 每臂只评一次(epoch19),
+  # 没有"多峰值"可保;而每个 ckpt 含 EMA+optimizer 达 12GB, top_k=5 会爆盘(150G/2臂)。
+  # 若改成多次 rollout(调小 skip_epochs/rollout_freq), 可再适当调大。
+  save_top_k: 1
   # 额外存 last.ckpt, 便于断点续训。
   save_last: True
   # 必须 false: EMA shadow 权重通过 callback state 持久化, weights_only 会丢掉它。
