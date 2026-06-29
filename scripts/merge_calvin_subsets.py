@@ -34,43 +34,54 @@ def find_train_dir(subset_root: Path) -> Path:
     raise FileNotFoundError(f"在 {subset_root} 下找不到含 episode_*.npz 的 training 目录")
 
 
-def merge_lang(dst_dir: Path, src_dirs, sub_name: str):
-    """合并某个 lang 子目录(lang_annotations / lang_filtered)的 auto_lang_ann.npy。"""
-    merged = None
-    n_files = 0
+def filter_and_write_lang(dst_dir: Path, src_dirs, have: set):
+    """合并 + 过滤语言标注, 写 lang_annotations/ 与 lang_filtered/。
+
+    ⚠️ VyoJ 子集里的 lang_annotations 是 **整集 ABCD_D** 标注(每子集都含全量,引用全 24
+    子集的帧), 且没有 lang_filtered/。所以不能 naive 拼接(会得到 N×全量 + 大量引用缺失帧)。
+    正确做法: 汇总所有子集的 lang_annotations -> 按 (start,end) 去重 -> 只保留"整窗 [start,end]
+    的帧都在合并目录(have)里"的标注, 同步过滤并行的 language.{ann,emb,task}。
+    """
+    # 1) 汇总(去重)所有子集的整集标注
+    base = None
+    seen = set()
+    keep_se = []       # 去重后的 (start,end)
+    src_records = []   # 对应 (源dict, 行号) 以便取并行字段
     for sd in src_dirs:
-        f = sd / sub_name / "auto_lang_ann.npy"
+        f = sd / "lang_annotations" / "auto_lang_ann.npy"
         if not f.exists():
             continue
         d = np.load(f, allow_pickle=True).item()
-        n_files += 1
-        if merged is None:
-            merged = d
-            # 转成可扩展的容器
-            merged["info"]["indx"] = list(d["info"]["indx"])
-            for k in list(d["language"].keys()):
-                v = d["language"][k]
-                merged["language"][k] = list(v) if not isinstance(v, np.ndarray) else v
-            continue
-        # info.indx
-        merged["info"]["indx"].extend(list(d["info"]["indx"]))
-        # language.*
-        for k, v in d["language"].items():
-            if isinstance(v, np.ndarray):
-                merged["language"][k] = np.concatenate([np.asarray(merged["language"][k]), v], axis=0)
-            else:
-                merged["language"][k].extend(list(v))
-    if merged is None:
-        print(f"  [lang] {sub_name}: 无文件, 跳过")
-        return
-    # emb 等转回 ndarray
-    if "emb" in merged["language"] and not isinstance(merged["language"]["emb"], np.ndarray):
-        merged["language"]["emb"] = np.asarray(merged["language"]["emb"])
-    out = dst_dir / sub_name
-    out.mkdir(parents=True, exist_ok=True)
-    np.save(out / "auto_lang_ann.npy", merged, allow_pickle=True)
-    n_ann = len(merged["info"]["indx"])
-    print(f"  [lang] {sub_name}: 合并 {n_files} 个子集 -> {n_ann} 条标注 -> {out/'auto_lang_ann.npy'}")
+        if base is None:
+            base = d
+        for i, se in enumerate(d["info"]["indx"]):
+            s, e = int(se[0]), int(se[1])
+            if (s, e) in seen:
+                continue
+            seen.add((s, e))
+            keep_se.append((d, i, s, e))
+    if base is None:
+        print("  [lang] 子集无 lang_annotations, 跳过"); return
+    # 2) 只保留整窗帧齐全的
+    valid = [(d, i, s, e) for (d, i, s, e) in keep_se
+             if all((fr in have) for fr in range(s, e + 1))]
+    print(f"  [lang] 去重唯一={len(seen)}  整窗齐全(有效)={len(valid)}")
+    # 3) 重建 dict(并行字段对齐)
+    new = {"info": {"indx": [(s, e) for (_, _, s, e) in valid]}, "language": {}}
+    lang_keys = list(base["language"].keys())
+    for k in lang_keys:
+        col = []
+        is_np = isinstance(base["language"][k], np.ndarray)
+        for (d, i, _, _) in valid:
+            col.append(d["language"][k][i])
+        new["language"][k] = np.asarray(col) if is_np else col
+    # 4) 写两个文件夹(训练默认读 lang_filtered;task 字段供 plan 匹配)
+    for folder in ["lang_annotations", "lang_filtered"]:
+        o = dst_dir / folder
+        o.mkdir(parents=True, exist_ok=True)
+        np.save(o / "auto_lang_ann.npy", new, allow_pickle=True)
+    bad = sum(1 for (s, e) in new["info"]["indx"] if s not in have or e not in have)
+    print(f"  [lang] 写出 {len(valid)} 条 -> lang_annotations + lang_filtered  (缺失复检={bad})")
 
 
 def main():
@@ -118,9 +129,11 @@ def main():
         np.save(out / "ep_start_end_ids.npy", ep_se)
         print(f"[merge] ep_start_end_ids: {ep_se.shape[0]} 条序列 -> {out/'ep_start_end_ids.npy'}")
 
-    # 3) lang 两套
-    merge_lang(out, train_dirs, "lang_annotations")
-    merge_lang(out, train_dirs, "lang_filtered")
+    # 3) lang: 过滤整集标注到合并目录实际存在的帧(去重 + 整窗在场), 写 lang_annotations + lang_filtered
+    have = set()
+    for npz in out.glob("episode_*.npz"):
+        have.add(int(npz.name[8:15]))
+    filter_and_write_lang(out, train_dirs, have)
 
     # 4) 标量/配置从第一个子集拷
     first = train_dirs[0]
