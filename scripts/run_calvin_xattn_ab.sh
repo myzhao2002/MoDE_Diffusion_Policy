@@ -39,7 +39,7 @@ cd "$PROJECT_DIR" || { echo "FATAL: cannot cd $PROJECT_DIR"; exit 1; }
 echo "python: $(which python)   GPU:"; nvidia-smi -L 2>/dev/null || echo "  (无卡? 训练需要 GPU)"
 
 # ---- data check ----
-if [ ! -d "$ROOT/training" ] || [ -z "$(ls "$ROOT"/training/episode_*.npz 2>/dev/null | head -1)" ]; then
+if [ ! -d "$ROOT/training" ] || [ -z "$(find "$ROOT/training" -maxdepth 1 -name 'episode_*.npz' -print -quit 2>/dev/null)" ]; then
   echo "FATAL: 训练数据缺失 $ROOT/training"
   echo "       先跑: bash scripts/dl_calvin_subsets.sh 0 5"
   echo "             python scripts/merge_calvin_subsets.py --stage <stage> --out $ROOT/training"
